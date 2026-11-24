@@ -590,6 +590,17 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
 // and whether it binds a depth buffer.
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
+// The depth-bias and strip-cut state a graphics PSO seeds the list with at SetPipelineState, and whether it carries
+// the matching DYNAMIC_* flag. False for anything but a graphics PSO of a Vulkan device.
+struct GraphicsPipelineDynamicState {
+    float depth_bias_constant = 0.0f;
+    float depth_bias_clamp = 0.0f;
+    float depth_bias_slope = 0.0f;
+    std::uint32_t strip_cut = 0;  // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE
+    bool dynamic_depth_bias = false;
+    bool dynamic_strip_cut = false;
+};
+bool graphics_pipeline_dynamic_state(ID3D12PipelineState* pipeline, GraphicsPipelineDynamicState& state);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
@@ -662,6 +673,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 // object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
 // lists or `object` is null.
 bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
+
+// The depth-bias values and strip-cut value last recorded by ID3D12GraphicsCommandList9::RSSetDepthBias and
+// ::IASetIndexBufferStripCutValue. False when `list` is not one of this module's command lists.
+bool depth_bias_state(ID3D12GraphicsCommandList9* list, float& constant, float& clamp, float& slope);
+bool strip_cut_value(ID3D12GraphicsCommandList9* list, std::uint32_t& value);
 
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.

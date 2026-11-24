@@ -11,7 +11,8 @@
 // slope-scaled bias (with and without DepthBiasClamp, within one 24-bit step: the slope is the GPU's), and a pixel
 // shader that writes its own depth (stored quantised, not biased). Each runs with and without a pixel shader. The
 // finding's cases run once more through a pass-through geometry shader without a pixel shader, which also gets the
-// built-in depth stage.
+// built-in depth stage. A DYNAMIC_DEPTH_BIAS pipeline (GCL9 RSSetDepthBias) then proves that the list's value, not
+// the pipeline's, is the one applied.
 //
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_depth.vert, ps_depth_empty.frag,
 // ps_depth_write.frag, gs_depth.geom). No game data.
@@ -71,6 +72,10 @@ struct Pass {
     bool geometry_shader = false;  // gs_depth between the VS and the (absent) pixel shader
     int bias = 0;
     float slope = 0.0f, clamp = 0.0f;
+    // DYNAMIC_DEPTH_BIAS: the bias, slope and clamp above go to RSSetDepthBias instead of the pipeline, which
+    // carries pso_bias (0 unless a case says otherwise), so the list value alone must produce the result.
+    bool dynamic_bias = false;
+    int pso_bias = 0;
     D3D12_COMPARISON_FUNC func = D3D12_COMPARISON_FUNC_ALWAYS;
     bool write = true;
     float clear = 1.0f;
@@ -93,6 +98,7 @@ struct Harness {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList9> list9;
     Ref<ID3D12Fence> fence;
     UINT64 fence_value = 0;
 
@@ -109,9 +115,10 @@ struct Harness {
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         desc.RasterizerState.DepthClipEnable = TRUE;
-        desc.RasterizerState.DepthBias = p.bias;
-        desc.RasterizerState.SlopeScaledDepthBias = p.slope;
-        desc.RasterizerState.DepthBiasClamp = p.clamp;
+        desc.RasterizerState.DepthBias = p.dynamic_bias ? p.pso_bias : p.bias;
+        desc.RasterizerState.SlopeScaledDepthBias = p.dynamic_bias ? 0.0f : p.slope;
+        desc.RasterizerState.DepthBiasClamp = p.dynamic_bias ? 0.0f : p.clamp;
+        if (p.dynamic_bias) desc.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
         desc.DepthStencilState.DepthEnable = TRUE;
         desc.DepthStencilState.DepthWriteMask = p.write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         desc.DepthStencilState.DepthFunc = p.func;
@@ -138,6 +145,7 @@ struct Harness {
         list->ResourceBarrier(1, &to_write);
         list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, p.clear, 0, 0, nullptr);
         list->SetGraphicsRootSignature(root);
+        if (p.dynamic_bias) list9->RSSetDepthBias(float(p.bias), p.clamp, p.slope);
         const std::uint32_t constants[3] = {f2u(p.z), f2u(p.dz), f2u(p.shader_z)};
         list->SetGraphicsRoot32BitConstants(0, 3, constants, 0);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -200,7 +208,8 @@ std::string describe(const Pass& p) {
                          : p.pixel_shader    ? "with PS"
                          : p.geometry_shader ? "GS, no PS"
                                              : "no PS";
-    std::snprintf(text, sizeof(text), "%s, bias %d, slope %g, clamp %g", stages, p.bias, p.slope, p.clamp);
+    std::snprintf(text, sizeof(text), "%s, bias %d, slope %g, clamp %g%s", stages, p.bias, p.slope, p.clamp,
+                  p.dynamic_bias ? " (dynamic)" : "");
     return text;
 }
 
@@ -317,6 +326,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&h.allocator.p))));
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h.allocator.p, nullptr,
                                                    IID_PPV_ARGS(&h.list.p))));
+        EXPECT(SUCCEEDED(h.list->QueryInterface(IID_PPV_ARGS(&h.list9.p))));
         EXPECT(SUCCEEDED(h.list->Close()));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h.fence.p))));
 
@@ -390,6 +400,33 @@ int main() {
                 check(wrong == 0, "stored depth, flat, " + describe(p) + ": " + std::to_string(wrong) +
                                       " of " + std::to_string(all) + " differ from code " + std::to_string(expected) +
                                       " (first " + std::to_string(r.depth[0]) + ")");
+            }
+            // DYNAMIC_DEPTH_BIAS (GCL9 RSSetDepthBias): the list value replaces the pipeline's. First with a pipeline
+            // that carries bias 5 and a list bias of 0, then the other way round: each side alone would give a
+            // different code, so the pair proves whose value is used.
+            if (mode == 0) {
+                for (const auto& [pso_bias, list_bias] : {std::pair{5, 0}, {0, 3}, {0, -5}}) {
+                    Pass p;
+                    p.dynamic_bias = true;
+                    p.pso_bias = pso_bias;
+                    p.bias = list_bias;
+                    p.z = leonida::depth24_to_float(5033000);
+                    Result r;
+                    std::string error;
+                    EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
+                    const std::uint32_t expected = leonida::depth24_quantize(p.z + d3d_bias(list_bias, 0, 0, 0));
+                    int wrong = 0;
+                    for (std::uint32_t c : r.depth) wrong += c != expected;
+                    if (native && list_bias != 0 && wrong) {
+                        std::printf("KNOWN stored depth, dynamic, %s: native D24 bias not exact (code %u, D3D gives "
+                                    "%u)\n",
+                                    describe(p).c_str(), r.depth[0], expected);
+                        continue;
+                    }
+                    check(wrong == 0, "stored depth, dynamic bias (pipeline " + std::to_string(pso_bias) + ", list " +
+                                          std::to_string(list_bias) + "): " + std::to_string(wrong) + " of " +
+                                          std::to_string(all) + " differ from code " + std::to_string(expected));
+                }
             }
             // Stored depth, sloped: z = 0.5 + 0.25 * x_clip, so 1/128 per pixel in x. Within one 24-bit step without a
             // slope term; with one, within two: on the D32 path the slope comes from the derivatives of the

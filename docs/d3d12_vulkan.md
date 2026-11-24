@@ -193,6 +193,7 @@ The command-list surface maps to the IR as follows:
 | `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology. The console's rectangle list (17, PSO topology type 19) and quad list (19) are drawn as triangles, see *Console rectangle and quad lists* below |
 | `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
+| `RSSetDepthBias` / `IASetIndexBufferStripCutValue` (GCL9) | state, seeded from the pipeline at `SetPipelineState`; `vkCmdSetDepthBias` per draw and the cut value, where the PSO carries the matching `DYNAMIC_*` flag |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
 | `Dispatch` / `DispatchMesh` | command with a state snapshot |
 | `Copy*` / `Resolve*` / `Clear*` | copy/clear command |
@@ -389,14 +390,21 @@ What is implemented (all of it testable without the game):
   `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
   leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
   only holds back its own batch) and `VulkanFence` (a timeline semaphore).
-- **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
-  `OMSetFrontAndBackStencilRef`), `ID3D12CommandQueue`, `ID3D12CommandAllocator` and `ID3D12Fence1` (with
+- **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList9` (the GCL7/8 chain plus
+  `OMSetFrontAndBackStencilRef`, `RSSetDepthBias` and `IASetIndexBufferStripCutValue`), `ID3D12CommandQueue`,
+  `ID3D12CommandAllocator` and `ID3D12Fence1` (with
   `SetEventOnCompletion` events). Every method they do not implement is a stub generated at build time from the
   SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub reports its name once, so the vtables follow the SDK
   order exactly and nothing derived from the SDK is checked in. Unknown IIDs are logged and refused. Resources
   are identified by their `ID3D12Resource` pointer, and RTV/DSV CPU handles point at a `TargetView`.
   `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them); each draw sets them
   with `vkCmdSetStencilReference` and a face mask.
+  `RSSetDepthBias` and `IASetIndexBufferStripCutValue` are list state seeded from the pipeline at
+  `SetPipelineState`, as D3D12 does, and only a pipeline carrying the matching `DYNAMIC_*` flag reads them: replay
+  then issues `vkCmdSetDepthBias` before the draw and takes the strip-cut value from the draw. The bias is applied
+  by the rasterizer, so a `D24_UNORM_S8_UINT` target stored as `D32_SFLOAT_S8_UINT` (whose pixel stage carries bias
+  itself) keeps the pipeline's bias instead, logged once. `CheckFeatureSupport` reports
+  `OPTIONS16.DynamicDepthBiasSupported` and `OPTIONS15.DynamicIndexBufferStripCutSupported` TRUE accordingly.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -1302,9 +1310,11 @@ and any validation error fails them.
   argument kind (draw, draw indexed, dispatch, mesh dispatch) and the counted variants, in-range records
   bit-identical, garbage records bounded, records and counts past `max_command_count` empty, and the per-batch work
   budget saturating; clean SKIP without a Vulkan device.
-- `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
-  `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
-  creates only an allocator and a list, so it needs no GPU or Vulkan loader.
+- `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` and `9` surfaces: `QueryInterface` for both IIDs,
+  `OMSetFrontAndBackStencilRef(1, 2)`, `RSSetDepthBias` and `IASetIndexBufferStripCutValue` with the recorded values
+  (and their Reset defaults), and the reference count around the query. It creates only an allocator and a list, so
+  it needs no GPU or Vulkan loader. `d3d12_draw_test` and `d3d12_depth24_draw_test` apply the two GCL9 values to
+  real draws.
 - `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
   three overlapping values, whole and by rectangle, compared with the PC runtime on the layer's own adapter and WARP;
   the refused calls must fail `Close` and leave the destination as cleared.

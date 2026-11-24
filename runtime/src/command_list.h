@@ -452,6 +452,12 @@ struct Draw {
     Viewport viewport{};       // the first; more viewports are not modelled yet
     Rect scissor{};            // the first; D3D12 always scissors
     std::array<float, 4> blend_factor{1, 1, 1, 1};
+    // The list's depth-bias state (RSSetDepthBias) and index-buffer strip-cut value, read at the draw when the
+    // pipeline carries the matching DYNAMIC_* flag. Seeded from the pipeline state at SetPipelineState.
+    float depth_bias_constant = 0.0f;
+    float depth_bias_clamp = 0.0f;
+    float depth_bias_slope = 0.0f;
+    std::uint32_t strip_cut = 0;  // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE
     std::uint32_t stencil_front = 0;
     std::uint32_t stencil_back = 0;
     bool indexed = false;

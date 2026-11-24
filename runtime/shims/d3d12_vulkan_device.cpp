@@ -10663,6 +10663,9 @@ public:
     }
     bool compute() const { return pending_stream_kind_==2 || (registered_ && !is_graphics_); }
     bool graphics() const { return native_owner_ ? native_owner_->graphics() : pending_stream_kind_==1 || (registered_ && is_graphics_); }
+    const leonida::GraphicsPipeline& graphics_pipeline() const {
+        return native_owner_ ? native_owner_->graphics_pipeline() : graphics_;
+    }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const {
         return native_owner_ ? native_owner_->subgroup_requests() : subgroup_requests_;
     }
@@ -10734,6 +10737,10 @@ public:
         }
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
+        // The two GCL9 dynamic-state flags: the bias and the strip-cut value are then list state, seeded from the
+        // values below at SetPipelineState (the draw carries them, see leonida::Draw).
+        graphics_.dynamic_depth_bias = (desc.Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS) != 0;
+        graphics_.dynamic_strip_cut = (desc.Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT) != 0;
         if (!device_.arena.mapped) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
         }
@@ -10876,9 +10883,17 @@ public:
                      int(samples));
             depth24_fragment = false;
         }
-        const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
-                                                desc.RasterizerState.SlopeScaledDepthBias,
-                                                desc.RasterizerState.DepthBiasClamp,packed16_fallback?65535.0f:16777215.0f};
+        // DYNAMIC_DEPTH_BIAS: the values arrive per draw, so the shader patch keeps no bias of its own and the
+        // rasterizer takes them from vkCmdSetDepthBias at replay. On a D24 target stored as D32 the pixel stage
+        // would have to carry them instead, so the bias there stays the PSO's (reported, not silent).
+        if (depth24_fragment && graphics_.dynamic_depth_bias)
+            log_once("D24 depth stored as D32 keeps the PSO's depth bias, not the dynamic one; flag", 4);
+        const leonida::Depth24Bias depth24_bias{graphics_.dynamic_depth_bias ? 0 : desc.RasterizerState.DepthBias,
+                                                graphics_.dynamic_depth_bias ? 0.0f
+                                                                             : desc.RasterizerState.SlopeScaledDepthBias,
+                                                graphics_.dynamic_depth_bias ? 0.0f
+                                                                             : desc.RasterizerState.DepthBiasClamp,
+                                                packed16_fallback ? 65535.0f : 16777215.0f};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span<const std::uint8_t> raw_bytes{
@@ -11199,13 +11214,19 @@ public:
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
-        // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
-        raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
-        if (raster.depthBiasEnable) {
+        // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either. A dynamic
+        // pipeline with a D24 target therefore keeps the rasterizer path, with float depth bias on a D24 store.
+        raster.depthBiasEnable = !depth24_fragment && (graphics_.dynamic_depth_bias || r.DepthBias ||
+                                                       r.SlopeScaledDepthBias != 0.0f);
+        if (raster.depthBiasEnable && !graphics_.dynamic_depth_bias) {
             raster.depthBiasConstantFactor = float(r.DepthBias);
             raster.depthBiasClamp = r.DepthBiasClamp;
             raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
         }
+        // The state the list starts with at SetPipelineState, and what replay hands to vkCmdSetDepthBias.
+        graphics_.depth_bias_constant = float(r.DepthBias);
+        graphics_.depth_bias_clamp = r.DepthBiasClamp;
+        graphics_.depth_bias_slope = r.SlopeScaledDepthBias;
         raster.lineWidth = 1.0f;
         // No depth clipping: fragments outside the viewport's depth range are kept and their depth clamped to it, as
         // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
@@ -11281,11 +11302,15 @@ public:
             if ((n & (n - 1)) == 0) std::fprintf(stderr, "[rt] d3d12: depth-bounds PSO #%u\n", n);
         }
 
+        graphics_.depth_bias_clamp_supported = features.depthBiasClamp;
         if (raster.polygonMode != VK_POLYGON_MODE_FILL && !features.fillModeNonSolid)
             return stream_unsupported("wireframe fill needs fillModeNonSolid, which the device lacks; fill mode", r.FillMode);
         if (raster.depthBiasEnable && raster.depthBiasClamp != 0.0f && !features.depthBiasClamp)
             return stream_unsupported("a depth-bias clamp needs depthBiasClamp, which the device lacks; clamp x1000",
                           int(raster.depthBiasClamp * 1000));
+        if (graphics_.dynamic_depth_bias && r.DepthBiasClamp != 0.0f && !features.depthBiasClamp)
+            log_once("a dynamic depth-bias clamp needs depthBiasClamp, which the device lacks; the clamp is dropped",
+                     int(r.DepthBiasClamp * 1000));
         for (std::size_t i = 1; i < blends.size(); ++i)
             if (std::memcmp(&blends[i], &blends[0], sizeof(blends[0])) != 0 && !features.independentBlend)
                 return stream_unsupported("per-render-target blend state needs independentBlend, which the device lacks; target",
@@ -11412,6 +11437,7 @@ public:
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        recipe_.dynamic_depth_bias = graphics_.dynamic_depth_bias;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
@@ -11876,6 +11902,7 @@ private:
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
         bool conservative = false;
+        bool dynamic_depth_bias = false;  // VK_DYNAMIC_STATE_DEPTH_BIAS, as the draw supplies the values
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -11934,7 +11961,7 @@ private:
         // A mesh pipeline takes neither the topology nor the strides as dynamic state
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
         // With multiViewport enabled, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT allow 1..16 dynamic viewports/scissors.
-        VkDynamicState dyn_list[8]{};
+        VkDynamicState dyn_list[10]{};
         std::uint32_t dyn_count = 0;
         dyn_list[dyn_count++] =
             graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
@@ -11948,6 +11975,7 @@ private:
         dyn_list[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
         if (!r.mesh && !r.bindings.empty()) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         if (r.depth.depthBoundsTestEnable) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
+        if (recipe_.dynamic_depth_bias) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = dyn_count;
         dynamic.pDynamicStates = dyn_list;
@@ -18585,14 +18613,14 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS15*>(data);
             *opts = {};
             opts->TriangleFanSupported = FALSE;
-            opts->DynamicIndexBufferStripCutSupported = FALSE;
+            opts->DynamicIndexBufferStripCutSupported = TRUE;  // IASetIndexBufferStripCutValue (GCL9)
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS16: {
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16*>(data);
             *opts = {};
-            opts->DynamicDepthBiasSupported = FALSE;
+            opts->DynamicDepthBiasSupported = TRUE;  // RSSetDepthBias (GCL9)
             opts->GPUUploadHeapSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
         }
@@ -20015,6 +20043,19 @@ void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool
     // The id is the PSO's own ID3D12PipelineState pointer (PipelineState::id), which the list keeps a reference to.
     auto* pso = static_cast<PipelineState*>(reinterpret_cast<ID3D12PipelineState*>(id));
     pso->request_early(bound_targets, depth_bound);
+}
+
+bool graphics_pipeline_dynamic_state(ID3D12PipelineState* pipeline, GraphicsPipelineDynamicState& state) {
+    auto* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || !p->resolve_type(true)) return false;
+    const leonida::GraphicsPipeline& graphics = p->graphics_pipeline();
+    state.depth_bias_constant = graphics.depth_bias_constant;
+    state.depth_bias_clamp = graphics.depth_bias_clamp;
+    state.depth_bias_slope = graphics.depth_bias_slope;
+    state.strip_cut = graphics.strip_cut;
+    state.dynamic_depth_bias = graphics.dynamic_depth_bias;
+    state.dynamic_strip_cut = graphics.dynamic_strip_cut;
+    return true;
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

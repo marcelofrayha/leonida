@@ -165,6 +165,7 @@ int main(int argc, char** argv) {
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256), logic_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
+std::vector<std::uint8_t> strip_dyn16_pixels(size * 256), strip_dyn32_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
     bool ran_msaa = false;
     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
@@ -443,11 +444,13 @@ int main(int argc, char** argv) {
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12CommandAllocator> allocator;
         Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12GraphicsCommandList9> list9;
         Ref<ID3D12Fence> fence;
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
                                                    IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list9.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload the vertices, prepare the target.
@@ -692,6 +695,11 @@ int main(int argc, char** argv) {
             EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip32_pso.p))));
             strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
             EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip_off_pso.p))));
+            // DYNAMIC_INDEX_BUFFER_STRIP_CUT: the pipeline keeps the value DISABLED and the list supplies it.
+            Ref<ID3D12PipelineState> strip_dyn_pso;
+            strip_desc.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip_dyn_pso.p))));
+            strip_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
             const D3D12_VERTEX_BUFFER_VIEW strip_vbv{upload_va + 1024, sizeof(strip_verts), sizeof(Vertex)};
             struct StripPass {
@@ -699,11 +707,20 @@ int main(int argc, char** argv) {
                 D3D12_INDEX_BUFFER_VIEW ibv;
                 UINT index_count;
                 std::vector<std::uint8_t>* out;
+                D3D12_INDEX_BUFFER_STRIP_CUT_VALUE dynamic_cut;  // DISABLED: the pipeline's own value applies
             };
             const StripPass strip_passes[] = {
-                {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
-                {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels},
-                {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels},
+                {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels,
+                 D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED},
+                {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels,
+                 D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED},
+                {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels,
+                 D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED},
+                // The dynamic pair must match the two PSO-driven ones pixel for pixel.
+                {strip_dyn_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9,
+                 &strip_dyn16_pixels, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF},
+                {strip_dyn_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9,
+                 &strip_dyn32_pixels, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF},
             };
             UINT64 strip_fence = 10;
             for (const auto& sp : strip_passes) {
@@ -714,6 +731,8 @@ int main(int argc, char** argv) {
                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 list->IASetVertexBuffers(0, 1, &strip_vbv);
                 list->IASetIndexBuffer(&sp.ibv);
+                if (sp.dynamic_cut != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
+                    list9->IASetIndexBufferStripCutValue(sp.dynamic_cut);
                 list->RSSetViewports(1, &viewport);
                 list->RSSetScissorRects(1, &scissor);
                 list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -1284,6 +1303,7 @@ int main(int argc, char** argv) {
         root.reset();
         rtv_heap.reset();
         list.reset();
+        list9.reset();
         allocator.reset();
         queue.reset();
         fence.reset();
@@ -1356,7 +1376,7 @@ int main(int argc, char** argv) {
             const bool top = row < size / 2, left = col < size / 2;
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel want = (top && left) || (!top && !left) ? Pixel{255, 0, 0, 255} : Pixel{0, 0, 255, 255};
-            for (const auto& buf : {strip16_pixels, strip32_pixels}) {
+            for (const auto& buf : {strip16_pixels, strip32_pixels, strip_dyn16_pixels, strip_dyn32_pixels}) {
                 const std::uint8_t* got = buf.data() + row * 256 + col * 4;
                 if (!std::equal(want.begin(), want.end(), got) && mismatches++ < 6)
                     std::fprintf(stderr, "strip-cut pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
@@ -1370,8 +1390,8 @@ int main(int argc, char** argv) {
     }
     EXPECT(!mismatches);
     EXPECT(nocut_bl_red > 0);
-    std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
-                "bridge pixels in bottom-left)\n",
+    std::printf("strip cut (0xFFFF & 0xFFFFFFFF, each also through IASetIndexBufferStripCutValue): 4096/4096 pixels "
+                "matched each (no-cut negative control painted %u bridge pixels in bottom-left)\n",
                 nocut_bl_red);
     if (ran_msaa) {
         UINT half_changed = 0;

@@ -896,6 +896,15 @@ struct GraphicsPipeline {
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
+    // The two DYNAMIC_* PSO flags: the bias and the strip-cut value then come from the draw's list state
+    // (RSSetDepthBias, IASetIndexBufferStripCutValue) instead of this pipeline. The values below are the state the
+    // list starts with at SetPipelineState, taken from the rasterizer state and IBStripCutValue.
+    bool dynamic_depth_bias = false;
+    bool dynamic_strip_cut = false;
+    bool depth_bias_clamp_supported = false;  // the device enables the clamp; a dynamic clamp is dropped without it
+    float depth_bias_constant = 0.0f;
+    float depth_bias_clamp = 0.0f;
+    float depth_bias_slope = 0.0f;
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     bool depth_bounds = false;            // depthBoundsTestEnable: the bounds are dynamic (vkCmdSetDepthBounds)
@@ -1218,6 +1227,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // for depth-bounds pipelines only
+    PFN_vkCmdSetDepthBias set_depth_bias = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
@@ -2757,7 +2767,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
-        !vk.set_blend_constants || !vk.draw ||
+        !vk.set_blend_constants || !vk.set_depth_bias || !vk.draw ||
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return unsupported_at(__LINE__);
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
@@ -5600,11 +5610,17 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
                     ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
+                // DYNAMIC_INDEX_BUFFER_STRIP_CUT: the cut value is list state instead of the pipeline's.
+                const std::uint32_t cut = graphics.dynamic_strip_cut ? draw->strip_cut : graphics.strip_cut;
                 const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                     ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                      (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
+                                     ((cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                      (cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
                 vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
             }
+            if (graphics.dynamic_depth_bias)
+                vk.set_depth_bias(command_buffer, draw->depth_bias_constant,
+                                  graphics.depth_bias_clamp_supported ? draw->depth_bias_clamp : 0.0f,
+                                  draw->depth_bias_slope);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());

@@ -198,11 +198,11 @@ private:
 };
 
 class GraphicsCommandList final
-    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList8Stubs, ID3D12Object, ID3D12DeviceChild,
+    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList9Stubs, ID3D12Object, ID3D12DeviceChild,
                     ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
                     ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList3, ID3D12GraphicsCommandList4,
                     ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6, ID3D12GraphicsCommandList7,
-                    ID3D12GraphicsCommandList8> {
+                    ID3D12GraphicsCommandList8, ID3D12GraphicsCommandList9> {
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
@@ -238,6 +238,10 @@ public:
     }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    float depth_bias_constant() const { return depth_bias_constant_; }
+    float depth_bias_clamp() const { return depth_bias_clamp_; }
+    float depth_bias_slope() const { return depth_bias_slope_; }
+    std::uint32_t strip_cut() const { return strip_cut_; }
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
 
@@ -577,7 +581,8 @@ public:
         }
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+                           scissor_, blend_factor_, depth_bias_constant_, depth_bias_clamp_, depth_bias_slope_,
+                           strip_cut_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         note_direct_heap_indexing(graphics_.layout);
         draw.mesh = true;
         draw.viewports = draw_viewports();
@@ -962,6 +967,35 @@ public:
             return;
         front_stencil_ref_ = front;
         back_stencil_ref_ = back;
+    }
+
+    // GCL9. The depth bias a DYNAMIC_DEPTH_BIAS pipeline reads at draw time, replayed with vkCmdSetDepthBias. As in
+    // D3D12 the values are list state, seeded from the pipeline at SetPipelineState.
+    void STDMETHODCALLTYPE RSSetDepthBias(FLOAT depth_bias, FLOAT depth_bias_clamp, FLOAT slope) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList9::RSSetDepthBias");
+        if (list_.closed()) return;
+        if (defer([=](GraphicsCommandList& l) {
+                l.depth_bias_constant_ = depth_bias;
+                l.depth_bias_clamp_ = depth_bias_clamp;
+                l.depth_bias_slope_ = slope;
+            }))
+            return;
+        depth_bias_constant_ = depth_bias;
+        depth_bias_clamp_ = depth_bias_clamp;
+        depth_bias_slope_ = slope;
+    }
+
+    // GCL9. Only the three defined values are taken; replay turns the value into primitive restart where the bound
+    // index width matches, since Vulkan's cut value is fixed by that width.
+    void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList9::IASetIndexBufferStripCutValue");
+        if (list_.closed()) return;
+        if (value != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED &&
+            value != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF &&
+            value != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF)
+            return check(false);
+        if (defer([=](GraphicsCommandList& l) { l.strip_cut_ = u(value); })) return;
+        strip_cut_ = u(value);
     }
 
     // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels. The trace
@@ -1578,6 +1612,12 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    // RSSetDepthBias / IASetIndexBufferStripCutValue state, restored to the pipeline's at SetPipelineState and read
+    // by the draws that pipeline records.
+    float depth_bias_constant_ = 0.0f;
+    float depth_bias_clamp_ = 0.0f;
+    float depth_bias_slope_ = 0.0f;
+    std::uint32_t strip_cut_ = 0;
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -1669,6 +1709,14 @@ private:
         unregistered_pipeline_ = state && !compute_pipeline_ && !graphics_pipeline_;
         if (unregistered_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
+        // The dynamic-state values a PSO seeds the list with, as D3D12 does at SetPipelineState.
+        GraphicsPipelineDynamicState dynamic;
+        if (graphics_pipeline_dynamic_state(state, dynamic)) {
+            depth_bias_constant_ = dynamic.depth_bias_constant;
+            depth_bias_clamp_ = dynamic.depth_bias_clamp;
+            depth_bias_slope_ = dynamic.depth_bias_slope;
+            strip_cut_ = dynamic.strip_cut;
+        }
     }
 
     void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
@@ -1794,6 +1842,8 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        depth_bias_constant_ = depth_bias_clamp_ = depth_bias_slope_ = 0.0f;
+        strip_cut_ = 0;
         compute_ = {};
         graphics_ = {};
         cbv_srv_uav_heap_ = nullptr;
@@ -2217,8 +2267,9 @@ private:
     void record_raster_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
                             const leonida::IndirectDrawArgs* indirect = nullptr) {
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
-                           first, base_vertex, first_instance};
+                           scissor_, blend_factor_, depth_bias_constant_, depth_bias_clamp_, depth_bias_slope_,
+                           strip_cut_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
+                           base_vertex, first_instance};
         draw.viewports = draw_viewports();
         draw.depth_bounds = depth_bounds_;
         request_draw_pipeline();
@@ -2995,6 +3046,22 @@ bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
     GraphicsCommandList* l = GraphicsCommandList::from(list);
     if (!l || !object) return false;
     l->hold_for_recording(object);
+    return true;
+}
+
+bool depth_bias_state(ID3D12GraphicsCommandList9* list, float& constant, float& clamp, float& slope) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    constant = l->depth_bias_constant();
+    clamp = l->depth_bias_clamp();
+    slope = l->depth_bias_slope();
+    return true;
+}
+
+bool strip_cut_value(ID3D12GraphicsCommandList9* list, std::uint32_t& value) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    value = l->strip_cut();
     return true;
 }
 
