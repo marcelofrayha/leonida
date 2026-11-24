@@ -470,6 +470,15 @@ int main() {
     EXPECT(check_gfx_parity_gated("gfx: Flags=DYNAMIC_INDEX_BUFFER_STRIP_CUT", S_OK, false, false,
                                   &HostContext::dynamic_index_buffer_strip_cut,
                                   [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT; }));
+    // The layer reports both features and implements the GCL9 setters, so it takes the two flags whatever the host
+    // does: the gated comparisons above are skipped on a host without them, this one never is.
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS16 layer16{};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS15 layer15{};
+        EXPECT(SUCCEEDED(layer_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &layer16, sizeof(layer16))));
+        EXPECT(SUCCEEDED(layer_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15, &layer15, sizeof(layer15))));
+        EXPECT(layer16.DynamicDepthBiasSupported && layer15.DynamicIndexBufferStripCutSupported);
+    }
     EXPECT(check_gfx_parity("gfx: Flags=0x10 (unknown bit)", E_INVALIDARG, false, false,
                             [](auto& d) { d.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(0x10); }));
     EXPECT(check_gfx_parity("gfx: Flags=0x80000000 (unknown bit)", E_INVALIDARG, false, false,
