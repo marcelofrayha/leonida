@@ -2000,6 +2000,16 @@ def barycentric_fallback_override():
 VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
 
 
+def runtime_gpu_mesh_shader():
+    """Whether the GPU the runtime would use exposes VK_EXT_mesh_shader with meshShader, or None when
+    tools/vk_subgroup_info.py can't tell."""
+    try:
+        v = runtime_gpu_info().get("mesh_shader")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
+        return None
+
+
 def runtime_gpu_mesh_draws_crash():
     """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
     vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
@@ -2009,8 +2019,8 @@ def runtime_gpu_mesh_draws_crash():
     info = runtime_gpu_info()
     if not info or "driver_id" not in info:
         return None
-    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and \
-        info.get("mesh_in_supported_stages") is True
+    has_mesh = info.get("mesh_shader") if "mesh_shader" in info else info.get("mesh_in_supported_stages")
+    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and has_mesh is True
 
 
 def runtime_gpu_max_push_constants():
@@ -3119,12 +3129,12 @@ def main() -> int:
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
-                    help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
-                         "draws crash on the corpus' mesh shaders (BUILD-2202)")
+                    help="translate mesh shaders to compute shaders writing an output buffer; on by itself when "
+                         "the runtime's GPU lacks VK_EXT_mesh_shader (meshShader) or uses Intel's Windows Vulkan "
+                         "driver, whose mesh draws crash on the corpus' mesh shaders (BUILD-2202)")
     ap.add_argument("--native-mesh", action="store_true",
-                    help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
-                         "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
+                    help="keep native mesh shaders instead of turning on --mesh-compute automatically (for example "
+                         "to translate for another GPU, or for an Intel Windows driver that fixes BUILD-2202)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -3196,12 +3206,17 @@ def main() -> int:
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
     if "shaders" in stages and not a.mesh_compute and not a.native_mesh:
+        mesh_shader = runtime_gpu_mesh_shader()
         crash = runtime_gpu_mesh_draws_crash()
-        if crash:
+        if mesh_shader is False:
+            log("shaders: the GPU the runtime would use has no VK_EXT_mesh_shader (meshShader): "
+                "translating with --mesh-compute (--native-mesh keeps them native)")
+            a.mesh_compute = True
+        elif crash:
             log("shaders: the GPU the runtime would use is on Intel's Windows Vulkan driver, whose mesh draws crash on "
                 "these mesh shaders (BUILD-2202): translating with --mesh-compute (--native-mesh keeps them native)")
             a.mesh_compute = True
-        elif crash is None:
+        elif mesh_shader is None or crash is None:
             a.mesh_compute = keep_recorded_fallback("--mesh-compute", work)
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))

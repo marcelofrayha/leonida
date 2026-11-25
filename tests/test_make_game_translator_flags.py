@@ -191,7 +191,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_shader=True, mesh_crash=False):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -205,6 +205,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_mesh_shader", return_value=mesh_shader), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
@@ -277,9 +278,16 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main("--pc-tail-ubo", max_push_constants=256), (("--pc-tail-ubo",),) * 2)
 
     def test_mesh_compute_follows_the_device(self):
-        """On by itself on Intel's Windows Vulkan driver with mesh shaders (BUILD-2202), not elsewhere or where the
-        probe can't tell; --native-mesh keeps native mesh shaders there, and asked for, it is on everywhere. It
-        comes before the push-constant check, so 152 bytes are what a 144-byte Intel device is measured against."""
+        """On by itself when the GPU lacks VK_EXT_mesh_shader (meshShader) or on Intel's Windows Vulkan driver with
+        mesh shaders (BUILD-2202), not elsewhere or where the probe can't tell; --native-mesh keeps native mesh
+        shaders, and asked for, --mesh-compute is on everywhere. It comes before the push-constant check, so 152
+        bytes are what a 144-byte device is measured against."""
+        self.assertEqual(self.run_main(mesh_shader=False), (("--mesh-compute",),) * 2)
+        self.assertEqual(self.run_main(mesh_shader=True, mesh_crash=False), ((), ()))
+        self.assertEqual(self.run_main(mesh_shader=None, mesh_crash=None), ((), ()))
+        self.assertEqual(self.run_main("--native-mesh", mesh_shader=False), ((), ()))
+        self.assertEqual(self.run_main(mesh_shader=False, max_push_constants=144),
+                         (("--mesh-compute", "--pc-tail-ubo"),) * 2)
         self.assertEqual(self.run_main(mesh_crash=True), (("--mesh-compute",),) * 2)
         self.assertEqual(self.run_main(mesh_crash=False), ((), ()))
         self.assertEqual(self.run_main(mesh_crash=None), ((), ()))
@@ -288,11 +296,23 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(mesh_crash=True, max_push_constants=144),
                          (("--mesh-compute", "--pc-tail-ubo"),) * 2)
 
+    def test_runtime_gpu_mesh_shader_requires_a_boolean_probe_result(self):
+        for raw, want in (({"mesh_shader": True}, True),
+                          ({"mesh_shader": False}, False),
+                          ({}, None),
+                          ({"mesh_shader": 1}, None),
+                          ({"mesh_shader": "false"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertIs(make_game.runtime_gpu_mesh_shader(), want)
+
     def test_runtime_gpu_mesh_draws_crash_reads_the_probe(self):
         intel = make_game.VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
-        for raw, want in (({"driver_id": intel, "mesh_in_supported_stages": True}, True),
+        for raw, want in (({"driver_id": intel, "mesh_shader": True}, True),
+                          ({"driver_id": intel, "mesh_shader": False, "mesh_in_supported_stages": True}, False),
+                          ({"driver_id": intel, "mesh_in_supported_stages": True}, True),
                           ({"driver_id": intel, "mesh_in_supported_stages": False}, False),
                           ({"driver_id": intel}, False),
+                          ({"driver_id": 4, "mesh_shader": True}, False),
                           ({"driver_id": 4, "mesh_in_supported_stages": True}, False),
                           ({"device": "x"}, None),
                           ({}, None)):
@@ -318,7 +338,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
 
     AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
 
-    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False):
+    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_shader=True, mesh_crash=False):
         """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
         translations, lines = [], []
 
@@ -344,6 +364,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_mesh_shader", return_value=mesh_shader), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
@@ -392,11 +413,27 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         self.assertEqual(make_game.recorded_fallback_flags(os.path.join(self.work, "elsewhere")), ())
 
     def test_the_other_flags_are_not_kept_by_a_failed_probe(self):
-        # Only the two flags the probe decides are kept; one the user stops passing is dropped as before.
+        # Only the flags the probe decides are kept; one the user stops passing is dropped as before.
         self.build("--no-float-controls", per_vertex=False, max_push_constants=256)
         self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
         translations, _ = self.build(per_vertex=None, max_push_constants=None)
         self.assertEqual(translations, [("--f16-interp-fallback",)])
+
+    def test_mesh_compute_from_missing_extension_is_kept_on_probe_failure(self):
+        translations, log = self.build(per_vertex=True, max_push_constants=256, mesh_shader=False)
+        self.assertEqual(translations, [("--mesh-compute",)])
+        self.assertIn("no VK_EXT_mesh_shader (meshShader)", log)
+        self.assertEqual(self.recorded(), "--mesh-compute")
+        for ms, crash in ((None, None), (None, False), (True, None)):
+            with self.subTest(mesh_shader=ms, mesh_crash=crash):
+                translations, log = self.build(per_vertex=True, max_push_constants=256,
+                                               mesh_shader=ms, mesh_crash=crash)
+                self.assertEqual(translations, [])
+                self.assertIn("whether it needs --mesh-compute; the shaders were translated with it and it stays on",
+                              log)
+        translations, _ = self.build(per_vertex=True, max_push_constants=256, mesh_shader=True, mesh_crash=False)
+        self.assertEqual(translations, [()])
+        self.assertEqual(self.recorded(), "")
 
 
 if __name__ == "__main__":
