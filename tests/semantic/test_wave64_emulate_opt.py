@@ -1541,12 +1541,11 @@ class StructuredEmulationTests(unittest.TestCase):
         top_kinds = [(it[0], it[1]) for it in gen.emulate_plan["tree"]]
         # Blocks 0, 2, 4 are all direct top-level ("block", b) items; only blocks 1 and 3 are guarded!
         self.assertEqual(top_kinds, [("block", 0), ("guard", 1), ("block", 2), ("guard", 3), ("block", 4)])
-        self.assertIn("%x_pre_vote_fn = OpFunction", spv)
-        self.assertIn("%x_pre_both_fn = OpFunction", spv)
-        self.assertIn("%x_pre_data_fn = OpFunction", spv)
-        self.assertGreaterEqual(spv.count("OpFunctionCall %uint %x_pre_vote_fn"), 2)
-        self.assertEqual(spv.count("OpFunctionCall %uint %x_pre_both_fn"), 1)
-        self.assertEqual(spv.count("OpFunctionCall %uint %x_pre_data_fn"), 1)
+        # Inline x_round emits direct division-free mod-6 exchanges with 0x108 WorkgroupMemory barriers (no %x_pre_*_fn calls).
+        self.assertNotIn("%x_pre_", spv)
+        self.assertEqual(spv.count("OpFunctionCall"), 0)
+        self.assertEqual(spv.count("OpUMod"), 0)
+        self.assertGreaterEqual(spv.count("OpControlBarrier %c2 %c2 %c108"), 4)
         # Verify binary SPIR-V assembly with tools/spirv_asm.py
         import spirv_asm
         binary = spirv_asm.assemble(spv, target_env="vulkan1.2")

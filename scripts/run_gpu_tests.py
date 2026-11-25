@@ -1212,7 +1212,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
-"cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
+                      "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_w64x_xround_coalesce", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
@@ -1296,6 +1296,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
                 "cs_w64x_mask_reuse": [8, 40, 8, 40, 2, 20, 10, 64],
                 "cs_w64x_mask_reuse2": [10, 20, 8, 8, 5, 2, 132, 131],
+                "cs_w64x_xround_coalesce": [147, 308, 1832, 444, 625, 1335, 2379, 332],
                 "cs_w64x_chain_barrier": [564, 563, 500, 627],
                 "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
                 "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],

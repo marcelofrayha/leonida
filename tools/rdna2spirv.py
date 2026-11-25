@@ -398,7 +398,14 @@ class Gen:
         self.x_dirty = set()       # emulate: (memory kind "lds"/"mem", "r"/"w") accessed since the last round
         self.x_tok = {}            # emulate: register -> the SSA id last stored to it in this block (its value's identity)
         self.x_gen = 0             # emulate: bumped at every label (control flow inside a block): forgets x_tok
+        self._x_gen_seq = 0        # emulate: monotonic counter allocating distinct x_gen ids
+        self._x_sel_stack = []     # emulate_inline: [merge_lbl, saved_x_gen, mask_reg_written] for open selections
         self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
+        self.x_vcache = {}         # emulate: wave_mask key -> %bool wave-wide Any vote already known in this block
+        self.x_flcache = {}        # emulate: exec wave_mask key -> %uint first active lane (0..63) in this block
+        self.x_vkeys = {}          # emulate: per-lane mask %uint SSA id -> list of wave_mask keys holding it
+        self._pending_scc_vote = None  # emulate_inline: deferred (kind, bit_id, vkeys) for %scc before next read/vote
+        self._flushing_scc_vote = False
         self.lane_either = {}      # id(instruction) -> SGPRs holding constant 0/-1 (EITHER) there
         self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
@@ -427,8 +434,6 @@ class Gen:
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # shared format encoder for stores through a dynamic V#
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
-        self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
-        self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
@@ -445,7 +450,31 @@ class Gen:
             self.consts[v] = f"%c{v:x}"
         return self.consts[v]
 
+    def _bump_x_gen(self):
+        self._x_gen_seq += 1
+        self.x_gen = self._x_gen_seq
+
+    def _mark_x_sel_dirty(self):
+        for entry in self._x_sel_stack:
+            entry[2] = True
+
+    def clear_x_caches(self):
+        self.flush_pending_scc_vote()
+        self.x_tok.clear()
+        self.x_mcache.clear()
+        self.x_vcache.clear()
+        self.x_flcache.clear()
+        self.x_vkeys.clear()
+        self._x_sel_stack.clear()
+
     def emit(self, s):
+        if self._pending_scc_vote is not None and not self._flushing_scc_vote:
+            if s.startswith("OpStore %scc "):
+                self._pending_scc_vote = None
+            elif ("%scc" in s or s.endswith("= OpLabel")
+                  or s.startswith(("OpSelectionMerge ", "OpLoopMerge ", "OpControlBarrier ",
+                                   "OpBranch", "OpSwitch ", "OpReturn", "OpStore %pc "))):
+                self.flush_pending_scc_vote()
         self.body.append("         " + s)
         if s.startswith("OpStore %active "):
             if self.exec_static_true:
@@ -457,8 +486,21 @@ class Gen:
             if s.startswith(("OpStore %vcc ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
                 self.x_tok[reg] = val
+                self._mark_x_sel_dirty()
+            elif s.startswith(("OpStore %vcc_hi ", "OpLoopMerge ")):
+                self._mark_x_sel_dirty()
+            elif self.emulate_inline and s.startswith("OpSelectionMerge "):
+                self._x_sel_stack.append([s.split()[1], self.x_gen, False])
             elif s.endswith("= OpLabel"):
-                self.x_gen += 1
+                lbl = s.split()[0]
+                if self.emulate_inline and self._x_sel_stack and self._x_sel_stack[-1][0] == lbl:
+                    _, saved_gen, dirty = self._x_sel_stack.pop()
+                    if not dirty:
+                        self.x_gen = saved_gen
+                    else:
+                        self._bump_x_gen()
+                else:
+                    self._bump_x_gen()
 
     # ---- register access ----
     def reg_ptr(self, kind, r):
@@ -490,6 +532,7 @@ class Gen:
         if kind == "sgpr":
             self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
+            self._mark_x_sel_dirty()
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         p = self.reg_ptr(kind, r)
@@ -1654,7 +1697,10 @@ class Gen:
         return bit
 
     def set_exec(self, mask_u):
-        self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
+        b = self.tmp_bool_nz(mask_u)
+        self.emit(f"OpStore %active {b}")
+        if self.emulate:
+            self.x_vkeys.setdefault(mask_u, []).append(("exec", self.x_gen, b))
         self.uses_active = True
 
     def vcc_half_keeps_mask(self):
@@ -1746,6 +1792,14 @@ class Gen:
                 and not ins["op"].endswith("_dpp") and not any(m.startswith(DPP_MODS) for m in ins["mods"])
                 and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes)
 
+    def _batchable_rfl(self, ins):
+        if not self.emulate_inline or base_op(ins["op"]) != "v_readfirstlane_b32" or ins["mods"]:
+            return False
+        a = ins["args"]
+        return (len(a) == 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1
+                and a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1
+                and ("v", a[1]["r"]) not in self.lane_masks.get(id(ins), {}))
+
     def insns(self, seq):
         """Translate seq, a straight run of instructions (no branch among them). A run of at least MIN_ACTIVE_RUN
         lane-local VALU instructions goes inside one `if (active)` and writes its VGPRs directly: the driver
@@ -1756,6 +1810,14 @@ class Gen:
         local = [self.exec_changes and not self.emulate and self.lane_local(i) for i in seq]
         i = 0
         while i < len(seq):
+            if self._batchable_rfl(seq[i]):
+                rfl_end = i + 1
+                while rfl_end < len(seq) and self._batchable_rfl(seq[rfl_end]):
+                    rfl_end += 1
+                if rfl_end - i >= 2:
+                    self._emit_rfl_run(seq[i:rfl_end])
+                    i = rfl_end
+                    continue
             j = i
             while j < len(seq) and local[j]:
                 j += 1
@@ -5612,41 +5674,53 @@ class Gen:
     def x_order_barrier(self):
         """Order pending memory/LDS accesses across both halves of an emulated wave64."""
         if self.emulate_inline:
-            self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
+            if self._pending_scc_vote is not None and not self._flushing_scc_vote:
+                self.flush_pending_scc_vote()
+                if self.x_dirty:
+                    sem = 0x108 if all(k == "lds" for k, _ in self.x_dirty) else 0x948
+                    self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(sem)}")
+                    self.x_dirty = set()
+                return
+            sem = 0x108 if (self.x_dirty and all(k == "lds" for k, _ in self.x_dirty)) else 0x948
+            self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(sem)}")
             self.x_dirty = set()
         else:
             self.x_split()
 
-    def _ensure_x_pre_fn(self, kind):
-        """Build (once per module) the barrier-free helper OpFunction for an inline wave64 x_round pre-barrier step.
+    def _x_has_schedulers(self):
+        return bool(self.emulate_plan and (self.emulate_plan["mini_blocks"] or self.emulate_plan["tail_blocks"]))
 
-        Outlines the ~20-30 instructions of ring-buffer slot clearing (`sn = (it + 1) % 3`), mask/data slot indexing,
-        and pre-barrier %x_buf store/OpAtomicOr out of %main while keeping OpControlBarrier directly at the callsite
-        in %main. Returns the helper function's SPIR-V id (`%x_pre_vote_fn`, `%x_pre_mask_fn`, or `%x_pre_data_fn`).
+    def _x_inline_slots_and_reset(self, it):
+        """Compute `(s, n1)` for inline wave64 round `it` and reset round `(it + 1) % 3` in `%x_buf`.
+
+        When no round-loop scheduler (`mini_blocks` / `tail_blocks`) exists in the module, `%x_it` stays in
+        `0..5` (`lcm(2, 3) = 6`), preserving both `it & 1` parity and `it % 3` slot indexing with zero `OpUMod`
+        divisions and skipping unused scheduler-word atomic stores.
         """
-        fn_name = f"%x_pre_{kind}_fn"
-        if kind in self.x_round_fns:
-            return fn_name
         w, mask, sched, sink = self.x_sizes()
-        tail_params = {"vote": ["val"], "data": ["val"], "mask": ["b0", "b1"], "both": ["val", "b0", "b1"]}[kind]
-        if w == 1:
-            p_names = ["it", "li"] + tail_params
+        has_sched = self._x_has_schedulers()
+        if not has_sched:
+            ge3, sub3, s, eq5, add1, n1 = (self.tmp() for _ in range(6))
+            self.emit(f"{ge3} = OpUGreaterThanEqual %bool {it} {self.cu(3)}")
+            self.emit(f"{sub3} = OpISub %uint {it} {self.cu(3)}")
+            self.emit(f"{s} = OpSelect %uint {ge3} {sub3} {it}")
+            self.emit(f"{eq5} = OpIEqual %bool {it} {self.cu(5)}")
+            self.emit(f"{add1} = OpIAdd %uint {it} {self.cu(1)}")
+            self.emit(f"{n1} = OpSelect %uint {eq5} {self.cu(0)} {add1}")
         else:
-            p_names = ["it", "li", "lane", "wave"] + tail_params
-        arity = len(p_names)
-        fn_type = self.x_round_fn_types.setdefault(arity, f"%fn_x_pre{arity}")
-        params = {k: f"%xp_{kind}_{k}" for k in p_names}
-        p_it, p_li = params["it"], params["li"]
-        saved, self.body = self.body, []
-        n1, sn = self.tmp(), self.tmp()
-        self.emit(f"{n1} = OpIAdd %uint {p_it} {self.cu(1)}")
-        self.emit(f"{sn} = OpUMod %uint {n1} {self.cu(3)}")
+            s, n1 = self.tmp(), self.tmp()
+            self.emit(f"{s} = OpUMod %uint {it} {self.cu(3)}")
+            self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
+        s2, sp1, sn = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{s2} = OpIEqual %bool {s} {self.cu(2)}")
+        self.emit(f"{sp1} = OpIAdd %uint {s} {self.cu(1)}")
+        self.emit(f"{sn} = OpSelect %uint {s2} {self.cu(0)} {sp1}")
         if w == 1:
             m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(8))
             self.emit(f"{m2} = OpIMul %uint {sn} {self.cu(2)}")
             self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
             self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
-            self.emit(f"{ml} = OpIEqual %bool {p_li} {self.cu(0)}")
+            self.emit(f"{ml} = OpIEqual %bool %x_li {self.cu(0)}")
             self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
             self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
             self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
@@ -5654,70 +5728,248 @@ class Gen:
             self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
             self.emit(f"OpAtomicStore {mp6} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
         else:
-            p_lane, p_wave = params["lane"], params["wave"]
             m0, m1, m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(10))
             self.emit(f"{m0} = OpIMul %uint {sn} {self.cu(w)}")
-            self.emit(f"{m1} = OpIAdd %uint {m0} {p_wave}")
+            self.emit(f"{m1} = OpIAdd %uint {m0} %x_wave")
             self.emit(f"{m2} = OpIMul %uint {m1} {self.cu(2)}")
             self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
             self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
-            self.emit(f"{ml} = OpIEqual %bool {p_lane} {self.cu(0)}")
+            self.emit(f"{ml} = OpIEqual %bool %x_lane {self.cu(0)}")
             self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
             self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
             self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
             self.emit(f"OpAtomicStore {mp5} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
             self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
             self.emit(f"OpAtomicStore {mp6} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
-            q0, q1, q2, ql, q3, q4, qp3, qp4 = (self.tmp() for _ in range(8))
-            self.emit(f"{q0} = OpIMul %uint {sn} {self.cu(2)}")
-            self.emit(f"{q1} = OpIAdd %uint {q0} {self.cu(sched)}")
-            self.emit(f"{q2} = OpIAdd %uint {q1} {self.cu(1)}")
-            self.emit(f"{ql} = OpIEqual %bool {p_li} {self.cu(0)}")
-            self.emit(f"{q3} = OpSelect %uint {ql} {q1} {self.cu(sink)}")
-            self.emit(f"{q4} = OpSelect %uint {ql} {q2} {self.cu(sink)}")
-            self.emit(f"{qp3} = OpAccessChain %_ptr_WG_uint_x %x_buf {q3}")
-            self.emit(f"OpAtomicStore {qp3} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
-            self.emit(f"{qp4} = OpAccessChain %_ptr_WG_uint_x %x_buf {q4}")
-            self.emit(f"OpAtomicStore {qp4} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
-        if kind in ("data", "both"):
-            par, data_base, i, p = (self.tmp() for _ in range(4))
-            self.emit(f"{par} = OpBitwiseAnd %uint {p_it} {self.cu(1)}")
+            if has_sched:
+                q0, q1, q2, ql, q3, q4, qp3, qp4 = (self.tmp() for _ in range(8))
+                self.emit(f"{q0} = OpIMul %uint {sn} {self.cu(2)}")
+                self.emit(f"{q1} = OpIAdd %uint {q0} {self.cu(sched)}")
+                self.emit(f"{q2} = OpIAdd %uint {q1} {self.cu(1)}")
+                self.emit(f"{ql} = OpIEqual %bool %x_li {self.cu(0)}")
+                self.emit(f"{q3} = OpSelect %uint {ql} {q1} {self.cu(sink)}")
+                self.emit(f"{q4} = OpSelect %uint {ql} {q2} {self.cu(sink)}")
+                self.emit(f"{qp3} = OpAccessChain %_ptr_WG_uint_x %x_buf {q3}")
+                self.emit(f"OpAtomicStore {qp3} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
+                self.emit(f"{qp4} = OpAccessChain %_ptr_WG_uint_x %x_buf {q4}")
+                self.emit(f"OpAtomicStore {qp4} {self.cu(2)} {self.cu(0)} {self.cu(0)}")
+        return s, n1
+
+    def _x_round_inline(self, data=None, bits=None):
+        w, mask, _, _ = self.x_sizes()
+        it = self.tmp()
+        self.emit(f"{it} = OpLoad %uint %x_it")
+        s, n1 = self._x_inline_slots_and_reset(it)
+        data_base = None
+        if data is not None:
+            par, data_base, idx, ptr = (self.tmp() for _ in range(4))
+            self.emit(f"{par} = OpBitwiseAnd %uint {it} {self.cu(1)}")
             self.emit(f"{data_base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
-            self.emit(f"{i} = OpIAdd %uint {data_base} {p_li}")
-            self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
-            self.emit(f"OpStore {p} {params['val']}")
-            ret_id = data_base
-        if kind in ("vote", "mask", "both"):
+            self.emit(f"{idx} = OpIAdd %uint {data_base} %x_li")
+            self.emit(f"{ptr} = OpAccessChain %_ptr_WG_uint_x %x_buf {idx}")
+            self.emit(f"OpStore {ptr} {data}")
+        rm = rm1 = None
+        if bits is not None:
             if w == 1:
-                s, c, rm = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{s} = OpUMod %uint {p_it} {self.cu(3)}")
+                c, rm = self.tmp(), self.tmp()
                 self.emit(f"{c} = OpIMul %uint {s} {self.cu(2)}")
                 self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
             else:
-                s, a, b, c, rm = (self.tmp() for _ in range(5))
-                self.emit(f"{s} = OpUMod %uint {p_it} {self.cu(3)}")
+                a, b, c, rm = (self.tmp() for _ in range(4))
                 self.emit(f"{a} = OpIMul %uint {s} {self.cu(w)}")
-                self.emit(f"{b} = OpIAdd %uint {a} {params['wave']}")
+                self.emit(f"{b} = OpIAdd %uint {a} %x_wave")
                 self.emit(f"{c} = OpIMul %uint {b} {self.cu(2)}")
                 self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
-            p0, old0 = self.tmp(), self.tmp()
-            self.emit(f"{p0} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm}")
-            self.emit(f"{old0} = OpAtomicOr %uint {p0} {self.cu(2)} {self.cu(0)} {params['b0' if kind in ('mask', 'both') else 'val']}")
-            if kind in ("mask", "both"):
+            if bits[0] is not None:
+                p0, old0 = self.tmp(), self.tmp()
+                self.emit(f"{p0} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm}")
+                self.emit(f"{old0} = OpAtomicOr %uint {p0} {self.cu(2)} {self.cu(0)} {bits[0]}")
+            if bits[1] is not None:
                 rm1, p1, old1 = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{rm1} = OpIAdd %uint {rm} {self.cu(1)}")
                 self.emit(f"{p1} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm1}")
-                self.emit(f"{old1} = OpAtomicOr %uint {p1} {self.cu(2)} {self.cu(0)} {params['b1']}")
-            ret_id = rm
-        lines, self.body = self.body, saved
-        self.x_round_fns[kind] = (
-            [f"{fn_name} = OpFunction %uint None {fn_type}"] +
-            [f"{params[k]} = OpFunctionParameter %uint" for k in p_names] +
-            [f"{fn_name}_entry = OpLabel"] +
-            lines +
-            [f"         OpReturnValue {ret_id}", "OpFunctionEnd"]
-        )
-        return fn_name
+                self.emit(f"{old1} = OpAtomicOr %uint {p1} {self.cu(2)} {self.cu(0)} {bits[1]}")
+        sem = 0x948 if (("mem", "r") in self.x_dirty or ("mem", "w") in self.x_dirty) else 0x108
+        self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(sem)}")
+        self.emit(f"OpStore %x_it {n1}")
+        self.x_dirty = set()
+        res = None
+        if bits is not None:
+            lo_v = self.x_word(rm) if bits[0] is not None else self.cu(0)
+            hi_v = self.x_word(rm1) if bits[1] is not None else None
+            res = (lo_v, hi_v)
+        if data is None:
+            return None, res
+
+        def read(lane):
+            if w == 1:
+                j = self.tmp()
+                self.emit(f"{j} = OpIAdd %uint {data_base} {lane}")
+                return self.x_lane_word(j, lane)
+            i, j = self.tmp(), self.tmp()
+            self.emit(f"{i} = OpIAdd %uint {data_base} %x_wbase")
+            self.emit(f"{j} = OpIAdd %uint {i} {lane}")
+            return self.x_lane_word(j, lane)
+        return read, res
+
+    def x_first_lane_from_words(self, lo, hi):
+        lz, hz, l, h, h32, fh, first = (self.tmp() for _ in range(7))
+        self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
+        self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
+        self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
+        self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
+        self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(0)}")
+        self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+        return first
+
+    def _emit_rfl_run(self, run):
+        """Emit a contiguous run of >= 2 `v_readfirstlane_b32` instructions in `emulate_inline` mode,
+        batching up to 64 values from `wave_lane == first` across one `OpControlBarrier` once `first` is known."""
+        exec_key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
+        first = self.x_flcache.get(exec_key)
+        if first is None and exec_key in self.x_mcache:
+            lo, hi = self.x_mcache[exec_key]
+            first = self.x_first_lane_from_words(lo, hi)
+            self.x_flcache[exec_key] = first
+        idx = 0
+        if first is None:
+            self.insn(run[0])
+            first = self.x_flcache[exec_key]
+            idx = 1
+        rem = len(run) - idx
+        if rem == 1:
+            self.insn(run[idx])
+            return
+        w, mask, _, _ = self.x_sizes()
+        while idx < len(run):
+            chunk = run[idx:idx + 64]
+            idx += len(chunk)
+            srcs = [self.load_reg("vgpr", ins["args"][1]["r"]) for ins in chunk]
+            pending = self._pending_scc_vote
+            self._pending_scc_vote = None
+            self._flushing_scc_vote = True
+            try:
+                it = self.tmp()
+                self.emit(f"{it} = OpLoad %uint %x_it")
+                s, n1 = self._x_inline_slots_and_reset(it)
+                par, data_base = self.tmp(), self.tmp()
+                self.emit(f"{par} = OpBitwiseAnd %uint {it} {self.cu(1)}")
+                self.emit(f"{data_base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
+                w_base = data_base
+                if w > 1:
+                    w_base = self.tmp()
+                    self.emit(f"{w_base} = OpIAdd %uint {data_base} %x_wbase")
+                rm = None
+                if pending is not None:
+                    p_kind, p_bit, p_vkeys = pending
+                    if w == 1:
+                        c, rm = self.tmp(), self.tmp()
+                        self.emit(f"{c} = OpIMul %uint {s} {self.cu(2)}")
+                        self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
+                    else:
+                        a, b, c, rm = (self.tmp() for _ in range(4))
+                        self.emit(f"{a} = OpIMul %uint {s} {self.cu(w)}")
+                        self.emit(f"{b} = OpIAdd %uint {a} %x_wave")
+                        self.emit(f"{c} = OpIMul %uint {b} {self.cu(2)}")
+                        self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
+                    p0, old0 = self.tmp(), self.tmp()
+                    self.emit(f"{p0} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm}")
+                    self.emit(f"{old0} = OpAtomicOr %uint {p0} {self.cu(2)} {self.cu(0)} {p_bit}")
+                is_src, lbl_do, lbl_end = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{is_src} = OpIEqual %bool {self.wave_lane()} {first}")
+                self.emit(f"OpSelectionMerge {lbl_end} None")
+                self.emit(f"OpBranchConditional {is_src} {lbl_do} {lbl_end}")
+                self.emit(f"{lbl_do} = OpLabel")
+                for k, sv in enumerate(srcs):
+                    slot = w_base if k == 0 else self.tmp()
+                    if k:
+                        self.emit(f"{slot} = OpIAdd %uint {w_base} {self.cu(k)}")
+                    ptr = self.tmp()
+                    self.emit(f"{ptr} = OpAccessChain %_ptr_WG_uint_x %x_buf {slot}")
+                    self.emit(f"OpStore {ptr} {sv}")
+                self.emit(f"OpBranch {lbl_end}")
+                self.emit(f"{lbl_end} = OpLabel")
+                sem = 0x948 if (("mem", "r") in self.x_dirty or ("mem", "w") in self.x_dirty) else 0x108
+                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(sem)}")
+                self.emit(f"OpStore %x_it {n1}")
+                self.x_dirty = set()
+                if pending is not None:
+                    self._finish_scc_vote_word(p_kind, self.x_word(rm), p_vkeys)
+            finally:
+                self._flushing_scc_vote = False
+            # OpLabel inside the single-writer selection bumped x_gen, but no mask or register changed:
+            # restore exec_key's cached first-lane across chunks and for any trailing EXEC read in the block.
+            new_exec_key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
+            self.x_flcache[new_exec_key] = first
+            if exec_key in self.x_mcache:
+                self.x_mcache[new_exec_key] = self.x_mcache[exec_key]
+            if exec_key in self.x_vcache:
+                self.x_vcache[new_exec_key] = self.x_vcache[exec_key]
+            exec_key = new_exec_key
+            for k, ins in enumerate(chunk):
+                self.cur_ins = ins
+                self.cur_masks = self.lane_masks.get(id(ins), {})
+                slot = w_base if k == 0 else self.tmp()
+                if k:
+                    self.emit(f"{slot} = OpIAdd %uint {w_base} {self.cu(k)}")
+                self.store_reg("sgpr", ins["args"][0]["r"], self.x_word(slot))
+
+    def record_any_vote(self, keys, any_id):
+        for k in keys:
+            if k is not None:
+                self.x_vcache[k] = any_id
+
+    def x_cached_any(self, keys):
+        if (self._pending_scc_vote is not None and not self._flushing_scc_vote
+                and self._pending_scc_vote[0] == "Any"
+                and any(k in self._pending_scc_vote[2] for k in keys)):
+            self.flush_pending_scc_vote()
+        for k in keys:
+            if k in self.x_vcache:
+                return self.x_vcache[k]
+        for k in keys:
+            if k in self.x_mcache:
+                lo, hi = self.x_mcache[k]
+                if self.wave64 and hi is not None:
+                    u, any_ = self.tmp(), self.tmp()
+                    self.emit(f"{u} = OpBitwiseOr %uint {lo} {hi}")
+                    self.emit(f"{any_} = OpINotEqual %bool {u} {self.cu(0)}")
+                else:
+                    any_ = self.tmp()
+                    self.emit(f"{any_} = OpINotEqual %bool {lo} {self.cu(0)}")
+                self.record_any_vote(keys, any_)
+                return any_
+        return None
+
+    def _finish_scc_vote_word(self, kind, word, vkeys):
+        b, z = self.tmp(), self.tmp()
+        self.emit(f"{b} = {'OpIEqual' if kind == 'All' else 'OpINotEqual'} %bool {word} {self.cu(0)}")
+        if kind == "Any" and vkeys:
+            self.record_any_vote(vkeys, b)
+        self.emit(f"{z} = OpSelect %uint {b} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"OpStore %scc {z}")
+
+    def defer_scc_vote(self, kind, b, vkeys=()):
+        eff = b
+        if kind == "All":
+            eff = self.tmp()
+            self.emit(f"{eff} = OpLogicalNot %bool {b}")
+        bit = self.tmp()
+        self.emit(f"{bit} = OpSelect %uint {eff} {self.cu(1)} {self.cu(0)}")
+        self._pending_scc_vote = (kind, bit, tuple(vkeys))
+
+    def flush_pending_scc_vote(self):
+        if self._pending_scc_vote is None or self._flushing_scc_vote:
+            return
+        p_kind, p_bit, p_vkeys = self._pending_scc_vote
+        self._pending_scc_vote = None
+        self._flushing_scc_vote = True
+        try:
+            lo = self._x_round_inline(bits=(p_bit, None))[1][0]
+            self._finish_scc_vote_word(p_kind, lo, p_vkeys)
+        finally:
+            self._flushing_scc_vote = False
 
     def x_round(self, data=None, bits=None):
         """One exchange: this lane's uint `data` goes to its slot, `bits` (lo, hi; None = nothing) are ORed into
@@ -5725,78 +5977,37 @@ class Gen:
         and (lo, hi) is the OR over all 64 lanes. In round-loop mode both are valid in the next segment; in
         inline structured mode (`emulate_inline`) the barrier runs directly in place with zero x_split."""
         if self.emulate_inline:
-            w, _, _, _ = self.x_sizes()
-            it, n1 = self.tmp(), self.tmp()
-            self.emit(f"{it} = OpLoad %uint %x_it")
-            if data is not None and bits is None:
-                fn = self._ensure_x_pre_fn("data")
-                args = f"{it} %x_li {data}" if w == 1 else f"{it} %x_li %x_lane %x_wave {data}"
-                data_base = self.tmp()
-                self.emit(f"{data_base} = OpFunctionCall %uint {fn} {args}")
-                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
-                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
-                self.emit(f"OpStore %x_it {n1}")
-                self.x_dirty = set()
-
-                def read(lane):
-                    if w == 1:
-                        j = self.tmp()
-                        self.emit(f"{j} = OpIAdd %uint {data_base} {lane}")
-                        return self.x_lane_word(j, lane)
-                    i, j = self.tmp(), self.tmp()
-                    self.emit(f"{i} = OpIAdd %uint {data_base} %x_wbase")
-                    self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                    return self.x_lane_word(j, lane)
-                return read, None
-            if data is None and bits is not None and bits[0] is not None and bits[1] is None:
-                fn = self._ensure_x_pre_fn("vote")
-                args = f"{it} %x_li {bits[0]}" if w == 1 else f"{it} %x_li %x_lane %x_wave {bits[0]}"
-                rm = self.tmp()
-                self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
-                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
-                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
-                self.emit(f"OpStore %x_it {n1}")
-                self.x_dirty = set()
-                return None, (self.x_word(rm), None)
-            if data is None and bits is not None:
-                fn = self._ensure_x_pre_fn("mask")
+            if self._pending_scc_vote is not None and not self._flushing_scc_vote:
+                if data is not None and bits is None:
+                    p_kind, p_bit, p_vkeys = self._pending_scc_vote
+                    self._pending_scc_vote = None
+                    self._flushing_scc_vote = True
+                    try:
+                        read, (lo, _) = self._x_round_inline(data=data, bits=(p_bit, None))
+                        self._finish_scc_vote_word(p_kind, lo, p_vkeys)
+                    finally:
+                        self._flushing_scc_vote = False
+                    return read, None
+                if data is None and bits is not None and bits[0] is not None and bits[1] is None:
+                    p_kind, p_bit, p_vkeys = self._pending_scc_vote
+                    self._pending_scc_vote = None
+                    self._flushing_scc_vote = True
+                    try:
+                        _, (lo, hi) = self._x_round_inline(data=None, bits=(p_bit, bits[0]))
+                        self._finish_scc_vote_word(p_kind, lo, p_vkeys)
+                    finally:
+                        self._flushing_scc_vote = False
+                    return None, (hi, None)
+                self.flush_pending_scc_vote()
+            if data is None and bits is not None and (bits[0] is None or bits[1] is not None):
                 b0 = bits[0] if bits[0] is not None else self.cu(0)
                 b1 = bits[1] if bits[1] is not None else self.cu(0)
-                args = f"{it} %x_li {b0} {b1}" if w == 1 else f"{it} %x_li %x_lane %x_wave {b0} {b1}"
-                rm, hi_i = self.tmp(), self.tmp()
-                self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
-                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
-                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
-                self.emit(f"OpStore %x_it {n1}")
-                self.x_dirty = set()
-                self.emit(f"{hi_i} = OpIAdd %uint {rm} {self.cu(1)}")
-                return None, (self.x_word(rm), self.x_word(hi_i))
-            fn = self._ensure_x_pre_fn("both")
-            b0 = bits[0] if bits[0] is not None else self.cu(0)
-            b1 = bits[1] if bits[1] is not None else self.cu(0)
-            args = f"{it} %x_li {data} {b0} {b1}" if w == 1 else f"{it} %x_li %x_lane %x_wave {data} {b0} {b1}"
-            rm, hi_i = self.tmp(), self.tmp()
-            self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
-            self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
-            self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
-            self.emit(f"OpStore %x_it {n1}")
-            self.x_dirty = set()
-            self.emit(f"{hi_i} = OpIAdd %uint {rm} {self.cu(1)}")
-            res = (self.x_word(rm), self.x_word(hi_i))
-
-            def read(lane):
-                par2, base = self.tmp(), self.tmp()
-                self.emit(f"{par2} = OpBitwiseAnd %uint {it} {self.cu(1)}")
-                self.emit(f"{base} = OpIMul %uint {par2} {self.cu(self.x_lanes)}")
-                if w == 1:
-                    j = self.tmp()
-                    self.emit(f"{j} = OpIAdd %uint {base} {lane}")
-                    return self.x_lane_word(j, lane)
-                i, j = self.tmp(), self.tmp()
-                self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
-                self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                return self.x_lane_word(j, lane)
-            return read, res
+                return self._x_round_inline(data=None, bits=(b0, b1))
+            if data is not None and bits is not None:
+                b0 = bits[0] if bits[0] is not None else self.cu(0)
+                b1 = bits[1] if bits[1] is not None else self.cu(0)
+                return self._x_round_inline(data=data, bits=(b0, b1))
+            return self._x_round_inline(data=data, bits=bits)
         it = self.tmp()
         self.emit(f"{it} = OpLoad %uint %x_it")
         if data is not None:
@@ -6085,9 +6296,26 @@ class Gen:
         could follow different s_cbranch_scc paths, which a hardware wave never does: it has one SCC."""
         if not self.cur_scc_live:
             return
+        self.uses_vote = True
+        if self.emulate:
+            vkeys = self.x_vkeys.get(v, ())
+            cached = self.x_cached_any(vkeys)
+            if cached is not None:
+                z = self.tmp()
+                self.emit(f"{z} = OpSelect %uint {cached} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"OpStore %scc {z}")
+                return
+            if self.emulate_inline:
+                self.defer_scc_vote("Any", self.tmp_bool_nz(v), vkeys)
+                return
+            any_, z = self.tmp(), self.tmp()
+            self.g_vote(any_, "Any", self.tmp_bool_nz(v))
+            self.record_any_vote(vkeys, any_)
+            self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
+            self.emit(f"OpStore %scc {z}")
+            return
         any_, z = self.tmp(), self.tmp()
         self.g_vote(any_, "Any", self.tmp_bool_nz(v))
-        self.uses_vote = True
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
 
@@ -6411,9 +6639,12 @@ class Gen:
             self.emit(f"{inh} = {'OpUGreaterThanEqual' if half == 'hi' else 'OpULessThan'} %bool {lane} {self.cu(32)}")
             self.emit(f"{both} = OpLogicalAnd %bool {inh} {mine}")
             mine = both
+        self.uses_vote = True
+        if self.emulate_inline:
+            self.defer_scc_vote("Any", mine)
+            return
         any_ = self.tmp()
         self.g_vote(any_, "Any", mine)
-        self.uses_vote = True
         z = self.tmp()
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
@@ -6672,8 +6903,13 @@ class Gen:
             self.store_reg("sgpr", d["r"], v)
             if d.get("n") == 2:
                 self.store_reg("sgpr", d["r"] + 1, v)
+            if self.emulate and (not self.wave64 or d.get("n") == 2):
+                toks = tuple(self.x_tok[("sgpr", d["r"] + i)] for i in range(d.get("n", 1)))
+                self.x_vkeys.setdefault(v, []).append(("v", self.x_gen, toks))
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
+            if self.emulate and (not self.wave64 or d["t"] == "vcc"):
+                self.x_vkeys.setdefault(v, []).append(("v", self.x_gen, v))
         elif d["k"] == "special" and d["t"] == "vcc_hi" and not self.wave64:
             self.emit(f"OpStore %vcc_hi {v}")
         else:
@@ -7458,8 +7694,14 @@ class Gen:
                 shuffled = read(safe_g)
                 src_ok = in_bounds if in_bounds is not None else "%true"
             else:
-                lo_bit, hi_bit = self.lane_bits(self.active_b())
-                read, (lo_word, hi_word) = self.x_round(data=src_val, bits=(lo_bit, hi_bit))
+                exec_key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
+                if exec_key in self.x_mcache:
+                    read, _ = self.x_round(data=src_val)
+                    lo_word, hi_word = self.x_mcache[exec_key]
+                else:
+                    lo_bit, hi_bit = self.lane_bits(self.active_b())
+                    read, (lo_word, hi_word) = self.x_round(data=src_val, bits=(lo_bit, hi_bit))
+                    self.x_mcache[exec_key] = (lo_word, hi_word)
                 shuffled = read(safe_g)
                 is_low = self.tmp()
                 self.emit(f"{is_low} = OpULessThan %bool {safe_g} {self.cu(32)}")
@@ -7824,18 +8066,24 @@ class Gen:
                 self.dst(a[0], r)
                 return
             if self.emulate:
-                # The wave's active lanes as two mask words and every lane's value, in one round.
-                v, act = self.src_u(a[1]), self.active_b()
-                lo_in, hi_in = self.lane_bits(act)
-                read, (lo, hi) = self.x_round(data=v, bits=(lo_in, hi_in))
-                lz, hz, l, h, h32, fh, first = (self.tmp() for _ in range(7))
-                self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
-                self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
-                self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
-                self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
-                self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
-                self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(0)}")
-                self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+                # The wave's active lanes as two mask words and every lane's value, in one round; when EXEC's
+                # mask or first active lane is already cached in this block, exchange only `data=v`.
+                v = self.src_u(a[1])
+                exec_key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
+                first = self.x_flcache.get(exec_key)
+                if first is not None:
+                    read, _ = self.x_round(data=v)
+                elif exec_key in self.x_mcache:
+                    read, _ = self.x_round(data=v)
+                    lo, hi = self.x_mcache[exec_key]
+                    first = self.x_first_lane_from_words(lo, hi)
+                    self.x_flcache[exec_key] = first
+                else:
+                    lo_in, hi_in = self.lane_bits(self.active_b())
+                    read, (lo, hi) = self.x_round(data=v, bits=(lo_in, hi_in))
+                    self.x_mcache[exec_key] = (lo, hi)
+                    first = self.x_first_lane_from_words(lo, hi)
+                    self.x_flcache[exec_key] = first
                 self.dst(a[0], read(first))
                 return
             self.uses_subgroup = self.uses_ballot = self.uses_vote = True
@@ -15745,7 +15993,7 @@ def assemble(gen):
         x_threads = (gen.cs or gen.ms)["size"]
         x_threads = x_threads[0] * x_threads[1] * x_threads[2]
         sx, sy, _ = (gen.cs or gen.ms)["size"]
-        for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
+        for v in (0, 1, 2, 3, 5, 6, 31, 63, 0x108, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
                   x_waves, sx, sx * sy, 0xFFFFFFC0):
             gen.cu(v)
         x_missing = gen.x_lanes - x_threads          # lanes of a partial last wave that don't exist
@@ -16107,8 +16355,6 @@ def assemble(gen):
         types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_enc_fn:
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
-    for arity, fn_type in sorted(gen.x_round_fn_types.items()):
-        types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
     # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
     st_types = bool(store_dims or gen.uses_int_fetch or gen.uses_d16_image)
@@ -16528,8 +16774,6 @@ def assemble(gen):
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
     for function in gen.tbuffer_norm_fns.values():
-        helpers.extend(function)
-    for function in gen.x_round_fns.values():
         helpers.extend(function)
     tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
@@ -18427,8 +18671,7 @@ def translate(path):
         g.desc_cache.clear()
         g._active_ssa = None
         g.sgpr_imm.clear()
-        g.x_tok.clear()
-        g.x_mcache.clear()
+        g.clear_x_caches()
         act = g.active_b()
         lbl_do, lbl_end = g.tmp(), g.tmp()
         g.emit(f"OpSelectionMerge {lbl_end} None")
@@ -18465,8 +18708,7 @@ def translate(path):
                         g.desc_cache.clear()
                         g._active_ssa = None
                         g.sgpr_imm.clear()
-                        g.x_tok.clear()
-                        g.x_mcache.clear()
+                        g.clear_x_caches()
                         uterm = None
                         for ins in blocks[u]:
                             op = base_op(ins["op"])
@@ -18541,8 +18783,7 @@ def translate(path):
         g.desc_cache.clear()
         g._active_ssa = None
         g.sgpr_imm.clear()
-        g.x_tok.clear()
-        g.x_mcache.clear()
+        g.clear_x_caches()
 
     for n, blk in enumerate(blocks):
         if n in absorbed:
@@ -18558,8 +18799,8 @@ def translate(path):
         g.block_label = f"%blk{n}"
         g.x_marks = []
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
-        g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
-        g.x_gen += 1
+        g.clear_x_caches()               # a register's value is only known from where this block wrote it
+        g._bump_x_gen()
         g.desc_cache.clear()
         g._active_ssa = None            # a cached lookup is only good inside the block that made it
         g.sgpr_imm.clear()
@@ -18582,8 +18823,7 @@ def translate(path):
                     g.desc_cache.clear()
                     g._active_ssa = None
                     g.sgpr_imm.clear()
-                    g.x_tok.clear()
-                    g.x_mcache.clear()
+                    g.clear_x_caches()
                     continue
                 nxt_skip = folds[cur]["skip"]
                 g.emit(f"OpStore %pc {g.cu(nxt_skip)}")
@@ -19104,7 +19344,20 @@ def branch_condition(g, op):
     # invocation per lane, each lane holds only its own bit, so the condition is reduced across the subgroup
     # (= the wave). Deciding per lane would let lanes skip scalar instructions the wave executes, leaving their
     # SGPRs stale, and would break cross-lane ops and barriers inside the block.
+    vkey = None
     if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+        if g.emulate_inline and (not g.wave64 or "vcc" in g.cur_masks):
+            vkey = ("v", g.x_gen, g.x_tok.get("%vcc", ("start", "vcc")))
+            cached = g.x_cached_any((vkey,))
+            if cached is not None:
+                if g.x_dirty:
+                    g.x_order_barrier()
+                g.uses_vote = True
+                if op == "s_cbranch_vccnz":
+                    return cached
+                b = g.tmp()
+                g.emit(f"{b} = OpLogicalNot %bool {cached}")
+                return b
         s = g.tmp()
         g.emit(f"{s} = OpLoad %uint %vcc")
         lane = g.tmp()
@@ -19122,9 +19375,23 @@ def branch_condition(g, op):
             g.emit(f"{both} = OpLogicalOr %bool {lane} {hi_nz}")
             lane = both
     else:
+        if g.emulate_inline:
+            vkey = ("exec", g.x_gen, g.x_tok.get("%active", "start"))
+            cached = g.x_cached_any((vkey,))
+            if cached is not None:
+                if g.x_dirty:
+                    g.x_order_barrier()
+                g.uses_vote = True
+                if op == "s_cbranch_execnz":
+                    return cached
+                b = g.tmp()
+                g.emit(f"{b} = OpLogicalNot %bool {cached}")
+                return b
         lane = g.active_b()
     any_ = g.tmp()
     g.g_vote(any_, "Any", lane)
+    if vkey is not None:
+        g.x_vcache[vkey] = any_
     g.uses_vote = True
     if op in ("s_cbranch_vccnz", "s_cbranch_execnz"):
         return any_

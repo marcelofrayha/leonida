@@ -779,7 +779,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
               ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171]),
               # SHADER-W64-SDST-PAIR: v_cmp_* / carry-out SGPR destinations printed as one register (no mattr line)
-              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
+              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5]),
+              # SHADER-W64-XROUND-BARRIERS: Any-vote reuse, deferred SCC coalescing, batched v_readfirstlane_b32
+              ("cs_w64x_xround_coalesce", [147, 308, 1832, 444, 625, 1335, 2379, 332])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0]),
