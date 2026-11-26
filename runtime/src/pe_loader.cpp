@@ -19,6 +19,7 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
+#include "bmi_emulation.h"
 #include "clzero_patch.h"
 #include "cpu_emulation.h"
 
@@ -2214,6 +2215,32 @@ void Loader::protect_sections(Module& m) {
             std::fprintf(stderr,
                          "[rt] loader: %s: %zu CLZERO loops run from stubs at %p (%zu bytes), not as a #UD per line\n",
                          m.name.c_str(), patched.sites, static_cast<void*>(patched.stubs), patched.stub_bytes);
+    }
+    static const auto bmi_host = rt::bmi_emulation::detect_host();
+    if ((!bmi_host.bmi1 || !bmi_host.lzcnt) && rt::bmi_emulation::lzcnt_patch_enabled()) {
+        std::vector<std::pair<uint32_t, uint32_t>> exec_ranges;
+        const IMAGE_SECTION_HEADER* cs = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++cs) {
+            if (!(cs->Characteristics & IMAGE_SCN_MEM_EXECUTE) || cs->VirtualAddress >= m.size) continue;
+            const uint64_t size = std::min<uint64_t>(std::min(cs->Misc.VirtualSize, cs->SizeOfRawData),
+                                                     m.size - cs->VirtualAddress);
+            if (size) exec_ranges.push_back({cs->VirtualAddress, static_cast<uint32_t>(size)});
+        }
+        const auto exc = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+        const RUNTIME_FUNCTION* pdata = nullptr;
+        uint32_t pdata_count = 0;
+        if (exc.VirtualAddress && exc.Size >= sizeof(RUNTIME_FUNCTION) && exc.VirtualAddress < m.size) {
+            const uint64_t max_bytes = std::min<uint64_t>(exc.Size, m.size - exc.VirtualAddress);
+            pdata_count = static_cast<uint32_t>(max_bytes / sizeof(RUNTIME_FUNCTION));
+            pdata = at<RUNTIME_FUNCTION>(m.base, exc.VirtualAddress);
+        }
+        const auto patched = rt::bmi_emulation::patch_image(
+            m.base, m.size, exec_ranges, pdata, pdata_count, !bmi_host.bmi1, !bmi_host.lzcnt);
+        if (patched.tzcnt_sites || patched.lzcnt_sites)
+            std::fprintf(stderr,
+                         "[rt] loader: %s: patched %zu TZCNT and %zu LZCNT sites (%zu stubs at %p, %zu #UD)\n",
+                         m.name.c_str(), patched.tzcnt_sites, patched.lzcnt_sites, patched.stub_sites,
+                         static_cast<void*>(patched.stubs), patched.ud2_sites);
     }
     VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
     auto* sec = IMAGE_FIRST_SECTION(nt);

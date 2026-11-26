@@ -360,6 +360,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
+  # BMI1, BMI2, MOVBE and legacy LZCNT/TZCNT emulation on pre-Haswell AVX1 + SSE4.2 hosts (src/bmi_emulation.h).
+  add_executable(bmi_emulation_test test/bmi_emulation_test.cpp)
+  target_include_directories(bmi_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(bmi_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(bmi_emulation_test PRIVATE /W4 /permissive- /utf-8)
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   set(dstorage_vectors "${CMAKE_CURRENT_BINARY_DIR}/dstorage_vectors.inc")
@@ -1572,6 +1578,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET cpu_emulation_test)
     add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
+  endif()
+  if(WIN32 AND TARGET bmi_emulation_test)
+    add_test(NAME bmi_emulation COMMAND bmi_emulation_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
