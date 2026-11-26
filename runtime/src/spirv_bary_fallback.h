@@ -50,7 +50,8 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
                                    const std::map<std::uint32_t, std::uint32_t>& per_vertex,
                                    std::vector<std::uint32_t>& gs_words,
                                    BaryFallbackGsInfo* out_info = nullptr,
-                                   std::string* error = nullptr) {
+                                   std::string* error = nullptr,
+                                   const std::map<std::uint32_t, std::uint32_t>* original_raw_vs_outputs = nullptr) {
     const auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -187,11 +188,14 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     if (clip_count && cull_count)
         return fail("bary_fallback: cannot forward mixed ClipDistance and CullDistance");
 
-    std::map<std::uint32_t, std::uint32_t> vs_out_loc_pointee;  // loc -> pointee_ty
+    struct VsOutput {
+        std::uint32_t var_id, pointee_ty;
+    };
+    std::map<std::uint32_t, VsOutput> vs_outputs;
     for (const auto& [target, loc] : vs_loc_decs) {
         const auto it = vs_out_var_pointee.find(target);
         if (it == vs_out_var_pointee.end()) continue;
-        if (!vs_out_loc_pointee.emplace(loc, it->second).second)
+        if (!vs_outputs.emplace(loc, VsOutput{target, it->second}).second)
             return fail("bary_fallback: duplicate VS Output Location " + std::to_string(loc));
     }
 
@@ -252,6 +256,12 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     }
 
     // Computed I/J pairs: the PS's Flat vec4[3] at `base` takes the three vertices' values of VS output `attr`.
+    // FP16 linking preserves the IDs of raw exports, but a decoded half can occupy a missing attribute's location.
+    const auto is_raw_vs_output = [&](std::uint32_t loc, std::uint32_t id) {
+        if (!original_raw_vs_outputs) return true;
+        const auto raw = original_raw_vs_outputs->find(loc);
+        return raw != original_raw_vs_outputs->end() && raw->second == id;
+    };
     struct PerVertex {
         std::uint32_t attr = 0;
         std::uint32_t base = 0;
@@ -284,8 +294,9 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
             }
         }
         PerVertex pv{attr, base, false};
-        if (const auto vs_it = vs_out_loc_pointee.find(attr); vs_it != vs_out_loc_pointee.end()) {
-            if (!vs_v4float_tys.count(vs_it->second))
+        if (const auto vs_it = vs_outputs.find(attr);
+            vs_it != vs_outputs.end() && is_raw_vs_output(attr, vs_it->second.var_id)) {
+            if (!vs_v4float_tys.count(vs_it->second.pointee_ty))
                 return fail("bary_fallback: VS Output at Location " + std::to_string(attr) + " is not vec4<f32>");
             pv.forwarded = true;
         }
@@ -305,9 +316,9 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         if (!ps_v4float_tys.count(pt_ty))
             return fail("bary_fallback: PS pass-through Input at Location " + std::to_string(loc) + " is not vec4<f32>");
         pass_locs.push_back(loc);
-        const auto vs_it = vs_out_loc_pointee.find(loc);
-        if (vs_it != vs_out_loc_pointee.end()) {
-            if (!vs_v4float_tys.count(vs_it->second))
+        const auto vs_it = vs_outputs.find(loc);
+        if (vs_it != vs_outputs.end()) {
+            if (!vs_v4float_tys.count(vs_it->second.pointee_ty))
                 return fail("bary_fallback: VS Output at Location " + std::to_string(loc) + " is not vec4<f32>");
             forwarded_locs.push_back(loc);
         } else {

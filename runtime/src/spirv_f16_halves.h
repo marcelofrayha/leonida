@@ -248,14 +248,16 @@ inline constexpr std::uint32_t f16_half_top_location(std::uint32_t max_vertex_ou
 //
 // Returns true on success (including the no-op fast path when no patching is needed). On failure returns false and
 // writes a concise reason to `*error` if non-null; the caller's word vectors are only replaced on success.
+// `original_raw_vs_outputs`, when requested, gets the original Location -> ID map excluding decoded FP16 halves.
 inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEntry& vs_entry,
                             std::vector<std::uint32_t>& ps_words, const ShaderEntry& ps_entry,
-                            std::string* error = nullptr, std::uint32_t top_location = 29) {
+                            std::string* error = nullptr, std::uint32_t top_location = 29,
+                            std::map<std::uint32_t, std::uint32_t>* original_raw_vs_outputs = nullptr) {
     const auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
     };
-    if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty()) return true;
+    if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty() && !original_raw_vs_outputs) return true;
 
     using namespace spirv_detail;
     Module vs_mod, ps_mod;
@@ -313,7 +315,10 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             if (!already_linked) break;
         }
     }
-    if (already_linked) return true;
+    if (already_linked) {
+        if (original_raw_vs_outputs) *original_raw_vs_outputs = std::move(vs_raw_outputs);
+        return true;
+    }
 
     // Choose paired [lo, hi] locations for every param in ps_entry.f16_halves.
     // Keep PS's existing locations unchanged whenever none collides with VS/PS raw outputs/inputs or exceeds top_location.
@@ -654,6 +659,7 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     vs_mod.insts = std::move(out_insts);
     vs_words = vs_mod.serialize();
     if (ps_changed) ps_words = ps_mod.serialize();
+    if (original_raw_vs_outputs) *original_raw_vs_outputs = std::move(vs_raw_outputs);
     return true;
 }
 

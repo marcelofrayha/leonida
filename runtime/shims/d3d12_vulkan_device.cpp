@@ -10990,6 +10990,8 @@ public:
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
         const bool bary_fallback = ps_stage.entry && ps_stage.entry->bary_fallback_location.has_value();
+        std::map<std::uint32_t, std::uint32_t> original_raw_vs_outputs;
+        decltype(original_raw_vs_outputs)* raw_vs_outputs = nullptr;
         if (bary_fallback) {
             const int bary_loc = int(*ps_stage.entry->bary_fallback_location);
             if (mesh) {
@@ -11021,8 +11023,10 @@ public:
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
+            if (bary_fallback && !ps_stage.entry->bary_fallback_per_vertex.empty())
+                raw_vs_outputs = &original_raw_vs_outputs;
             if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                 &link_error, bary_fallback)) {
+                                 &link_error, bary_fallback, raw_vs_outputs)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -11124,7 +11128,7 @@ public:
             if (!leonida::build_bary_fallback_gs(vs_stage.words, ps_stage.words,
                                                  *ps_stage.entry->bary_fallback_location,
                                                  ps_stage.entry->bary_fallback_per_vertex, words, &bary_info,
-                                                 &bary_error)) {
+                                                 &bary_error, raw_vs_outputs)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", bary_error.c_str());
                 return E_FAIL;
             }
@@ -12172,10 +12176,11 @@ private:
 
     bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
                          std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
-                         std::string* error, bool bary_fallback = false) const {
+                         std::string* error, bool bary_fallback,
+                         std::map<std::uint32_t, std::uint32_t>* original_raw_vs_outputs) const {
         const std::uint32_t top_loc =
             bary_fallback ? device_.bary_f16_half_top_location : device_.f16_half_top_location;
-        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error, top_loc);
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error, top_loc, original_raw_vs_outputs);
     }
 
 public:
@@ -12206,10 +12211,14 @@ public:
             if (source.slot == 0) vs = i;
             if (source.slot == 2) ps = i;
         }
+        std::map<std::uint32_t, std::uint32_t> original_raw_vs_outputs;
+        decltype(original_raw_vs_outputs)* raw_vs_outputs = nullptr;
         if (f16_linked_) {
-            if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why,
-                                 bary_fallback_))
+            if (vs == SIZE_MAX || ps == SIZE_MAX) return false;
+            if (bary_fallback_ && !sources_[ps].entry->bary_fallback_per_vertex.empty())
+                raw_vs_outputs = &original_raw_vs_outputs;
+            if (!link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why,
+                                 bary_fallback_, raw_vs_outputs))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -12227,7 +12236,7 @@ public:
                     !leonida::build_bary_fallback_gs(words[vs], words[ps],
                                                      *sources_[ps].entry->bary_fallback_location,
                                                      sources_[ps].entry->bary_fallback_per_vertex, words[i], nullptr,
-                                                     &why))
+                                                     &why, raw_vs_outputs))
                     return false;
             } else if (sources_[i].kind == StageSource::depth_only) {
                 words[i] = leonida::depth24_depth_only_fragment(depth24_bias_);

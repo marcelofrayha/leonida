@@ -7,6 +7,7 @@
 //   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
 //   7. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS `Flat vec4[3]` Input named by `per_vertex` gets the
 //      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals.
+//   8. Neither a relocated nor a static FP16 half can supply a missing raw computed-I/J attribute.
 // Optional `--dump-dir <dir>` writes each synthesized GS binary for external `spirv-val` inspection.
 // No GPU or game files required.
 #include "../src/spirv_bary_fallback.h"
@@ -638,6 +639,48 @@ int main(int argc, char** argv) {
         CHECK(refused(build_ps({}, {}, 3, {}, {0}), 3, {{0, 0}, {1, 0xfffffffeu}}));
         // An array the map names by its second location only.
         CHECK(refused(build_ps({}, {}, 3, {}, {0}), 3, {{0, 1}}));
+    }
+
+    // Relocating the two decoded halves to 13/14 must not make the VS appear to export raw attr14.
+    {
+        ShaderEntry vs_e, ps_e;
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs = build_vs({.raw_locs = {0}});
+        auto ps = build_ps({}, {}, 3, ps_e.f16_halves, {0, 4});
+        PerVertexMap raw_vs_outputs;
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        CHECK(link_f16_halves(vs, vs_e, ps, ps_e, &err, 14, &raw_vs_outputs));
+        CHECK(raw_vs_outputs.size() == 1 && raw_vs_outputs.count(0));
+        CHECK(build_bary_fallback_gs(vs, ps, 3, PerVertexMap{{14, 0}, {0, 4}}, gs,
+                                     nullptr, &err, &raw_vs_outputs));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        // Keep both decoded halves and the genuine per-vertex attr0, but zero-fill the array for attr14.
+        CHECK((ins.in_locs == std::set<std::uint32_t>{0, 13, 14}));
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{0, 4}));
+        CHECK(ins.out_pv_stores == 9 && ins.out_pv_null_stores == 3);
+        maybe_dump(dump_dir, "gs_per_vertex_relocated_half_alias", gs);
+        maybe_dump(dump_dir, "ps_per_vertex_relocated_half_alias", ps);
+    }
+
+    // The same rule applies when the FP16 linker leaves unused static VS halves in place on its no-op path.
+    {
+        ShaderEntry vs_e;
+        vs_e.f16_halves = {{8, {12, 13}}};
+        auto vs = build_vs({.raw_locs = {8}, .static_halves = vs_e.f16_halves});
+        const auto original_vs = vs;
+        auto ps = build_ps({}, {}, 3, {}, {0});
+        PerVertexMap raw_vs_outputs;
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        CHECK(link_f16_halves(vs, vs_e, ps, {}, &err, 14, &raw_vs_outputs));
+        CHECK(vs == original_vs && raw_vs_outputs.size() == 1 && raw_vs_outputs.count(8));
+        CHECK(build_bary_fallback_gs(vs, ps, 3, PerVertexMap{{13, 0}}, gs, nullptr, &err, &raw_vs_outputs));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK(ins.in_locs.empty() && ins.out_pv_stores == 0 && ins.out_pv_null_stores == 3);
+        maybe_dump(dump_dir, "gs_per_vertex_static_half_alias", gs);
     }
 
     return 0;
