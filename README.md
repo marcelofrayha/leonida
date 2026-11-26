@@ -202,7 +202,9 @@ Use `--wave64-emulate on` to force emulation or `--wave64-emulate off` to force 
 Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
 them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
 skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
-(read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
+(read raw barycentrics from an interpolated input; on by itself when the runtime's GPU lacks
+`VK_KHR_fragment_shader_barycentric` with `geometryShader` or has a known `BaryCoordKHR` driver bug, unless
+`LEONIDA_BARY_FALLBACK=0`),
 `--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
 `VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute; on by itself when the runtime's GPU has no
 `VK_EXT_mesh_shader` / `meshShader` or uses Intel's Windows Vulkan driver, whose native mesh draws crash, BUILD-2202,

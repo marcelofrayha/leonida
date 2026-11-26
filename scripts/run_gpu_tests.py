@@ -332,7 +332,8 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
 
 def bary_fallback() -> bool:
     """LEONIDA_BARY_FALLBACK=1 (or 0): translate raw barycentrics to an ordinary vec3 input and draw it through
-    tools/bary_fallback_gs.py. Unset, it is on where tools/vk_subgroup_info.py reports a driver with a known
+    tools/bary_fallback_gs.py. Unset, it is on where tools/vk_subgroup_info.py reports no
+    VK_KHR_fragment_shader_barycentric with geometryShader (NVIDIA Pascal, ...) or a driver with a known
     BaryCoordKHR bug: Mesa ANV (SHADER-925) and AMD's Windows driver on gfx90c iGPUs (#5933)."""
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):

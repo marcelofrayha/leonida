@@ -265,6 +265,14 @@ class MainWiringTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertIs(make_game.runtime_gpu_barycentric_fallback(), want)
 
+    def test_runtime_gpu_fragment_shader_barycentric_requires_a_boolean_probe_result(self):
+        for raw, want in (({"fragment_shader_barycentric": True}, True),
+                          ({"fragment_shader_barycentric": False}, False),
+                          ({}, None), ({"fragment_shader_barycentric": 0}, None),
+                          ({"fragment_shader_barycentric": "false"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertIs(make_game.runtime_gpu_fragment_shader_barycentric(), want)
+
     def test_pc_tail_ubo_follows_the_device(self):
         """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with
         --mesh-compute), not where it fits or can't be read; asked for explicitly, it is on everywhere."""
@@ -434,6 +442,38 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         translations, _ = self.build(per_vertex=True, max_push_constants=256, mesh_shader=True, mesh_crash=False)
         self.assertEqual(translations, [()])
         self.assertEqual(self.recorded(), "")
+
+    def test_bary_fallback_logs_missing_extension_and_is_kept_on_probe_failure(self):
+        with mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=True), \
+                mock.patch("make_game.runtime_gpu_fragment_shader_barycentric", return_value=False):
+            # build() mocks runtime_gpu_barycentric_fallback=None internally, so call through a helper patch:
+            pass
+        out = tempfile.TemporaryDirectory()
+        self.addCleanup(out.cleanup)
+        lines = []
+        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, "--work", self.work, "--no-tui"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch("make_game.below_normal"), \
+                mock.patch("make_game.choose_game", return_value=os.path.join(self.work, "game")), \
+                mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
+                mock.patch("make_game.wave64_settings", return_value=(True, True)), \
+                mock.patch("make_game.runtime_gpu_per_vertex", return_value=False), \
+                mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=True), \
+                mock.patch("make_game.runtime_gpu_fragment_shader_barycentric", return_value=False), \
+                mock.patch("make_game.runtime_gpu_max_push_constants", return_value=256), \
+                mock.patch("make_game.runtime_gpu_mesh_shader", return_value=False), \
+                mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=False), \
+                mock.patch("make_game.preflight") as preflight, \
+                mock.patch("make_game.shaders") as shaders, \
+                mock.patch.object(make_game, "log", lambda *a: lines.append(" ".join(map(str, a)))):
+            self.assertEqual(make_game.main(), 0)
+        joined = "\n".join(lines)
+        self.assertIn("no VK_KHR_fragment_shader_barycentric (fragmentShaderBarycentric)", joined)
+        self.assertNotIn("known BaryCoordKHR bug", joined)
+        self.assertEqual(preflight.call_args.kwargs["fallbacks"],
+                         ("--bary-fallback", "--mesh-compute", "--f16-interp-fallback"))
+        self.assertEqual(shaders.call_args.kwargs["fallbacks"],
+                         ("--bary-fallback", "--mesh-compute", "--f16-interp-fallback"))
 
 
 if __name__ == "__main__":

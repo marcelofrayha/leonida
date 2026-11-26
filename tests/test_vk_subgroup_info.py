@@ -70,6 +70,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    geometry_shader: bool = True
     task_shader: bool = False
     mesh_shader: bool = False
     max_push_constants_size: int = 256
@@ -229,7 +230,11 @@ class FakeVulkan:
         seen_types = set()
         for stype, node_addr in self._iter_chain(addr):
             seen_types.add(stype)
-            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.F2_GEOMETRY_SHADER
+                ).value = int(dev.geometry_shader)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS
                 ).value = int(dev.separate_depth_stencil_layouts)
@@ -378,6 +383,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
     def test_feature_and_property_offsets(self):
+        self.assertEqual(vk_info.F2_GEOMETRY_SHADER, 16 + 4 * 4)
         self.assertEqual(vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS, 16 + 4 * 35)
         self.assertEqual(vk_info.F12_TIMELINE_SEMAPHORE, 16 + 4 * 37)
         self.assertEqual(vk_info.F13_SUBGROUP_SIZE_CONTROL, 16 + 4 * 7)
@@ -829,6 +835,8 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "mesh_shader": False,
+                    "fragment_shader_barycentric": True,
+                    "geometry_shader": True,
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
@@ -916,6 +924,27 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(driver_id=driver))
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_when_extension_missing_and_geometry_shader_supported(self):
+        """Devices without VK_KHR_fragment_shader_barycentric take --bary-fallback iff geometryShader is supported
+        (NVIDIA Pascal, Intel Gen9.5, older GCN; MoltenVK lacks geometryShader and stays False)."""
+        ext = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
+        cases = (
+            ("pascal_no_ext_with_gs", False, (), True, 4, False, False, True),
+            ("feature_bit_without_ext_with_gs", True, (), True, 3, False, False, True),
+            ("ext_listed_feature_zero_with_gs", False, ext, True, 4, False, False, True),
+            ("moltenvk_with_bary_no_gs", True, ext, False, vk_info.VK_DRIVER_ID_MOLTENVK, True, False, False),
+            ("moltenvk_without_bary_no_gs", False, (), False, vk_info.VK_DRIVER_ID_MOLTENVK, False, False, False),
+            ("turing_with_bary_and_gs", True, ext, True, 4, True, True, False),
+        )
+        for label, bary_bit, names, gs, drv, want_bary, want_pv, want_fb in cases:
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary_bit, extension_names=names,
+                                                      geometry_shader=gs, driver_id=drv))
+                self.assertIs(res["fragment_shader_barycentric"], want_bary)
+                self.assertIs(res["geometry_shader"], gs)
+                self.assertIs(res["per_vertex_inputs"], want_pv)
+                self.assertIs(res["barycentric_fallback"], want_fb)
 
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
