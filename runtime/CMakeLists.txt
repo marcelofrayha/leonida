@@ -366,6 +366,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(bmi_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(bmi_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
+  # F16C, FMA3 and AVX2 256-bit XSTATE_AVX emulation on pre-Haswell AVX1 + SSE4.2 hosts (src/avx2_emulation.h).
+  add_executable(avx2_emulation_test test/avx2_emulation_test.cpp)
+  target_include_directories(avx2_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(avx2_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(avx2_emulation_test PRIVATE /W4 /permissive- /utf-8)
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   set(dstorage_vectors "${CMAKE_CURRENT_BINARY_DIR}/dstorage_vectors.inc")
@@ -1581,6 +1587,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET bmi_emulation_test)
     add_test(NAME bmi_emulation COMMAND bmi_emulation_test)
+  endif()
+  if(WIN32 AND TARGET avx2_emulation_test)
+    add_test(NAME avx2_emulation COMMAND avx2_emulation_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
