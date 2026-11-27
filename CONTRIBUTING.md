@@ -51,10 +51,11 @@ number and links nowhere now, including the two this page used to send you to: #
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
-- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all). The test
-  files with no `__main__` block or an `import pytest` (they need the packages in `tests/requirements.txt`) run with
-  `python -m pytest tests/test_<name>.py` instead, as [AGENTS.md](AGENTS.md) describes; under `python -I` they fail
-  to import or run nothing.
+- `python -I tests/test_<name>.py` runs a standalone unit test. For a pytest-based test, list the file in
+  [`tests/pytest-targets.txt`](tests/pytest-targets.txt), install `tests/requirements.txt`, and run
+  `python -m pytest tests/test_<name>.py`. Outside `tests/semantic/`, CI runs unlisted `test_*.py` files with
+  `python -I`, so those need a working `__main__` entry point. A pytest node ID in the list adds just that case
+  to pytest without removing its file from the standalone suite.
 - Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows; Linux and macOS configure the portable subset (`gta6rt` and the shims are Windows-only). Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink

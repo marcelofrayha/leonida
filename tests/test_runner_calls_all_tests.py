@@ -2,13 +2,13 @@
 
     python -I tests/test_runner_calls_all_tests.py
 
-tests/test_ci_registration.py sorts tests/test_*.py into CI jobs: a file without a PYTEST_FILE_MARKERS match but
-with a __main__ guard runs in the standard-library loop as ``python -I tests/<file>.py``, and pytest never
-imports it.  When such a runner forgets to call one of the file's top-level ``def test_*`` functions, those
+tests/test_ci_registration.py shares CI's explicit routing: a file not listed for pytest in
+tests/pytest-targets.txt runs in the standard-library loop as ``python -I tests/<file>.py``.
+When such a runner forgets to call one of the file's top-level ``def test_*`` functions, those
 checks run nowhere while the run still prints ok and exits 0 -- tests/test_cfg_structure.py carried a dead
 test_depth() this way (PR #3122 fixes it), and tests/test_feature_scan.py had the sibling bug of swallowing its
 only unrouted assert (PR #3051).  This is the runner counterpart of tests/test_ci_registration.py: it reuses
-that file's classification straight from the workflow (so it cannot drift from ci.yml) and fails for every
+that file's classification from the shared selector and fails for every
 stdlib-mode file whose __main__ block neither names each top-level test function nor dispatches the whole set
 through the ``globals()`` loop some runners use.  Intentional non-calls live in RUNNER_SKIPS with their reason,
 so a new dead test cannot hide behind a documented one.
@@ -56,7 +56,7 @@ RUNNER_SKIPS = {
 
 
 def runner_block(tree):
-    """The module's real ``if __name__ == "__main__":`` node, or None (a bare mention satisfies the loop's grep)."""
+    """The module's ``if __name__ == "__main__":`` node, or None."""
     for node in tree.body:
         if isinstance(node, ast.If) and "__main__" in ast.dump(node.test) and "__name__" in ast.dump(node.test):
             return node

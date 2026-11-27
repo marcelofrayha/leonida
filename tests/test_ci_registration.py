@@ -2,20 +2,18 @@
 
     python -I tests/test_ci_registration.py
 
-``.github/workflows/ci.yml`` splits ``tests/test_*.py`` between two jobs with a single predicate
-(``PYTEST_FILE_MARKERS``, or no ``__main__``): the standard-library loop in ``check`` runs the rest with
-``python -I``, and ``translator-tests`` hands the matched files to pytest.  ``tests/semantic/`` goes to
-``unittest discover`` and ``tests/*.cjs`` to ``node --test``.  This is the test-file counterpart of
-``tests/test_ctest_registration.py``: it reads the patterns from the workflow (not from a copy, so it cannot
-drift) and fails on the three ways a test goes missing without CI turning red --
+``.github/workflows/ci.yml`` uses ``scripts/list_python_tests.py`` to route ``tests/test_*.py``:
+``tests/pytest-targets.txt`` lists pytest's targets; the remaining files run with ``python -I``.
+``tests/semantic/`` goes to ``unittest discover`` and ``tests/*.cjs`` to ``node --test``.
+This is the test-file counterpart of ``tests/test_ctest_registration.py``: it shares the Python selector
+with the workflow and reads the semantic and viewer patterns from it. It fails on ways a test goes missing
+without CI turning red --
 
 * a file no job selects, because no glob matches its name: ``tests/thing_test.py`` matches neither
   ``test_*.py`` nor ``test*.py``;
-* a file a job selects but whose tests that job cannot collect, e.g. a standard-library script that trips
-  ``PYTEST_FILE_MARKERS`` and keeps its checks under ``if __name__ == "__main__":`` -- the loop skips it and
-  pytest imports it, collects nothing, and the job stays green because the other files supply items; and
-* a file the loop runs with ``python -I`` that only *mentions* ``__main__`` (the loop decides with
-  ``grep -q '__main__'``, which a comment satisfies), or whose guard is inverted
+* a file listed for pytest that keeps its only checks under ``if __name__ == "__main__":`` -- pytest
+  imports it, collects nothing, and the job stays green because the other files supply items;
+* a file the loop runs with ``python -I`` that only *mentions* ``__main__``, or whose guard is inverted
   (``if __name__ != "__main__":``) and runs nothing;
 * a semantic file with only module-level ``test*`` functions: ``unittest discover`` collects nothing
   there, even though pytest would; and
@@ -25,8 +23,8 @@ drift) and fails on the three ways a test goes missing without CI turning red --
 It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
 to run every file and then fail, since stopping at the first failure hides the files sorted after it.
 
-Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
-needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
+No game files, build tools or pytest are needed. The loop check needs bash (Git for Windows' on Windows)
+and skips without it, except on a GitHub runner.
 """
 import ast
 import fnmatch
@@ -41,6 +39,9 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
+SELECTOR = "scripts/list_python_tests.py"
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from list_python_tests import PYTEST_TARGETS, SEMANTIC_DIR, python_test_files, routes_for  # noqa: E402
 
 # What a file has to be called to claim it is a test. Any of these that no job selects is a bug, which is why
 # the suffix form (tests/thing_test.py) counts even though no job's glob matches it today.
@@ -53,7 +54,7 @@ def read(root, rel):
 
 
 def ci_rules(root):
-    """(markers, pruned, loop_glob, semantic_dir, viewer_glob), exactly as the workflow spells them."""
+    """(standalone files, pytest modules, semantic directory, viewer glob)."""
     text = read(root, WORKFLOW)
 
     def find(pattern, what):
@@ -64,17 +65,16 @@ def ci_rules(root):
                 "update this test together with the workflow")
         return match.groups()
 
-    (markers,) = find(r"^\s*PYTEST_FILE_MARKERS:\s*'([^']+)'", "PYTEST_FILE_MARKERS")
-    # The check loop and the translator list share this one find expression.
-    pruned, loop_glob = find(r"-path\s+'([^']+)'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'([^']+)'",
-                             "the tests/test_*.py scan")
     # scripts/run_semantic_tests.py runs the files unittest discover would find, one process each
     (semantic,) = find(r"(?:python\s+-m\s+unittest\s+discover\s+-s|python\s+-I\s+scripts/run_semantic_tests\.py)\s+(\S+)",
                        "the semantic suite's folder")
     (viewer,) = find(r"node\s+--test\s+(\S+)", "node --test")
     if re.search(r"unittest\s+discover[^\n]*-p\s", text):
         raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")
-    return markers, pruned.rstrip("/"), loop_glob, semantic.rstrip("/"), viewer
+    if semantic.rstrip("/") != SEMANTIC_DIR:
+        raise AssertionError(f"the selector prunes {SEMANTIC_DIR}, but ci.yml runs {semantic}")
+    stdlib, pytest = routes_for(root)
+    return set(stdlib), {target for target in pytest if "::" not in target}, SEMANTIC_DIR, viewer
 
 
 STDLIB_STEP = "Tests (standard library only, no game data)"
@@ -159,9 +159,9 @@ def matches_nonrecursive_glob(rel, pattern):
     return directory == pattern_dir and fnmatch.fnmatchcase(name, pattern_name)
 
 
-def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | None:
+def job_of(root, rel, rules):
     """Which job runs ``rel``: 'stdlib', 'pytest', 'semantic', 'viewer', or None for no job at all."""
-    markers, pruned, loop_glob, semantic, viewer = rules
+    stdlib, pytest, semantic, viewer = rules
     if rel.startswith(semantic + "/"):
         directory, _, name = rel.rpartition("/")
         # unittest discovery only descends into packages beneath its start directory.
@@ -172,12 +172,9 @@ def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | 
         return "semantic" if fnmatch.fnmatchcase(name, "test*.py") else None
     if matches_nonrecursive_glob(rel, viewer):
         return "viewer"
-    if rel.startswith(pruned + "/"):
-        return None                                # the Python scans prune this whole tree
-    if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], loop_glob):
-        source = read(root, rel)
-        if re.search(markers, source, re.M) or "__main__" not in source:
-            return "pytest"
+    if rel in pytest:
+        return "pytest"
+    if rel in stdlib:
         return "stdlib"
     return None
 
@@ -392,6 +389,51 @@ class RepositoryRegistrationTest(unittest.TestCase):
                          "Rename them to tests/test_*.py (or tests/test_*.cjs), put them under tests/semantic/ "
                          "as test*.py with an __init__.py in each nested directory, or add the pattern to ci.yml.")
 
+    def test_whole_file_routes_partition_nonsemantic_python_tests(self):
+        standalone, targets = routes_for(ROOT)
+        modules = [t for t in targets if "::" not in t]
+        self.assertEqual(sorted(standalone + modules), python_test_files(ROOT))
+        self.assertIn("tests/test_tex_headers.py", standalone)
+        self.assertIn("tests/test_tex_headers.py::TestTextureDescriptorParsing::"
+                      "test_stdlib_qword_scanner_edge_cases_and_parity", targets)
+
+    def test_selector_writes_lf_even_with_crlf_stdout(self):
+        # Emulate Python's Windows stdout on every host and capture bytes without newline normalization.
+        wrapper = ("import runpy, sys; "
+                   "sys.stdout.reconfigure(newline='\\r\\n'); "
+                   "runpy.run_path(sys.argv.pop(1), run_name='__main__')")
+        for runner, targets in zip(("stdlib", "pytest"), routes_for(ROOT)):
+            with self.subTest(runner=runner):
+                result = subprocess.run([sys.executable, "-I", "-c", wrapper, SELECTOR, runner],
+                                        cwd=ROOT, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(b"\r", result.stdout)
+                self.assertEqual(result.stdout.decode("utf-8").splitlines(), targets)
+
+    def test_manifest_rejects_stale_and_overlapping_targets(self):
+        file = "tests/test_example.py"
+        node = file + "::test_parity"
+        cases = (
+            ("tests/test_gone.py", "invalid or missing"),
+            ("tests/semantic/test_hidden.py", "invalid or missing"),
+            (file + "::", "invalid or missing"),
+            (f"{file}\n{file}", "duplicate or overlapping"),
+            (f"{node}\n{node}", "duplicate or overlapping"),
+            (f"{file}\n{node}", "duplicate or overlapping"),
+            (f"{node}\n{file}", "duplicate or overlapping"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, SEMANTIC_DIR))
+            for path in (file, "tests/semantic/test_hidden.py"):
+                with open(os.path.join(tmp, path), "w", encoding="utf-8", newline="\n"):
+                    pass
+            for contents, error in cases:
+                with self.subTest(contents=contents):
+                    with open(os.path.join(tmp, PYTEST_TARGETS), "w", encoding="utf-8", newline="\n") as f:
+                        f.write(contents + "\n")
+                    with self.assertRaisesRegex(ValueError, error):
+                        routes_for(tmp)
+
     def test_direct_testcase_import_alias(self):
         import_alias = "from unittest import TestCase as Parent\n"
         test_class = "class Example({base}):\n    def test_one(self): pass\n"
@@ -461,16 +503,17 @@ class RepositoryRegistrationTest(unittest.TestCase):
                 silent.append((job, rel))
         self.assertEqual(silent, [], "selected by CI, but the runner would collect no test:\n" + "\n".join(
             f"  {rel}: {job} imports it and collects nothing, so the job stays green. Give it a unittest.TestCase "
-            f"or a module-level test* function, or take it out of that job's list in ci.yml."
+             f"or a module-level test* function, or correct its routing in {PYTEST_TARGETS}."
             for job, rel in silent))
 
     def test_every_file_the_loop_runs_has_a_main_guard(self):
-        # The loop decides with `grep -q '__main__'`, which a comment satisfies; python -I would then import
-        # the file and run nothing.
+        # A standalone file with no entry point exits successfully without running anything.
         guardless = [f for f in self.files
                      if job_of(ROOT, f, self.rules) == "stdlib" and not has_main_guard(read(ROOT, f))]
-        self.assertEqual(guardless, [], "the check loop runs these with python -I, which executes no test:\n" +
-                         "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless))
+        self.assertEqual(
+            guardless, [], "the check loop runs these with python -I, which executes no test:\n"
+            + "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless)
+            + f"\nIf these are pytest files, list them in {PYTEST_TARGETS}.")
 
     def test_the_semantic_job_installs_what_its_spirv_gated_tests_need(self):
         # A test that skips without spirv-as / spirv-val runs only where something installed them. The runner images
@@ -572,8 +615,8 @@ class RepositoryRegistrationTest(unittest.TestCase):
             write("tests/test_plain.py", "import unittest\n"
                   "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
                   "if __name__ == \"__main__\":\n    unittest.main()\n")
-            # Trips PYTEST_FILE_MARKERS, so the loop skips it; its only check is under __main__, so pytest
-            # collects nothing: the file no job executes.
+            # The manifest sends this to pytest, but it has no collectable tests.
+            write(PYTEST_TARGETS, "tests/test_numpy_probe.py\n")
             write("tests/test_numpy_probe.py", "HAVE_NUMPY = False\n"
                   "def check():\n    assert 1 + 1 == 2\n"
                   "if __name__ == \"__main__\":\n    check()\n")
@@ -611,7 +654,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
     def test_semantic_selection_matches_discovery_through_packages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             rules = ci_rules(ROOT)
-            semantic = rules[3]
+            semantic = rules[2]
             cases = ("test_root.py", "packaged/test_packaged.py", "bare/test_bare.py",
                      "bare/leaf/test_bare_ancestor.py")
             for case in cases:
@@ -642,17 +685,19 @@ class StdlibLoopTest(unittest.TestCase):
             self.assertFalse(os.environ.get("GITHUB_ACTIONS"), "no bash found on the CI runner")
             self.skipTest("needs bash (Git for Windows on Windows)")
         script = step_script(ROOT, STDLIB_STEP)
-        markers = ci_rules(ROOT)[0]
         failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
-        passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        passing = "import sys\nif __name__ == \"__main__\":\n    assert not sys.stdin.read()\n"
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            os.makedirs(os.path.join(tmp, "scripts"))
+            shutil.copyfile(os.path.join(ROOT, SELECTOR), os.path.join(tmp, SELECTOR))
             files = {
                 "tests/test_a_fails.py": failing,
-                "tests/test_b_passes.py": passing,
+                "tests/test_b_passes.py": "HAVE_NUMPY = False\n" + passing,
                 "tests/test_c_fails.py": failing,
-                "tests/test_d_pytest.py": "import pytest\n" + failing,   # the loop leaves it to pytest
+                "tests/test_d_pytest.py": failing,  # skipped even though it could run as a script
                 "tests/semantic/test_e.py": failing,                    # pruned: unittest discover runs it
+                PYTEST_TARGETS: "tests/test_d_pytest.py\n",
             }
             for rel, text in files.items():
                 with open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="\n") as f:
@@ -666,7 +711,7 @@ class StdlibLoopTest(unittest.TestCase):
             with open(shim, "w", encoding="utf-8", newline="\n") as f:
                 f.write("#!/bin/sh\nexec '%s' \"$@\"\n" % sys.executable.replace("'", "'\\''"))
             os.chmod(shim, 0o755)
-            env = dict(os.environ, PYTEST_FILE_MARKERS=markers, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+            env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
             # GitHub runs `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`.
             result = subprocess.run([git_bash(), "--noprofile", "--norc", "-eo", "pipefail", "step.sh"], cwd=tmp,
                                     env=env, capture_output=True, text=True, timeout=120)
@@ -677,10 +722,16 @@ class StdlibLoopTest(unittest.TestCase):
         errors = re.findall(r"^::error file=(\S+)::", out, re.M)
         self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
 
-    def test_step_script_reads_the_check_loop(self):
-        script = step_script(ROOT, STDLIB_STEP)
-        self.assertIn('python -I "$t"', script)
-        self.assertIn("-name 'test_*.py'", script)
+    def test_workflow_steps_use_the_shared_selector(self):
+        for runner, names in (
+            ("stdlib", (STDLIB_STEP, "Tests (standard library only, Linux)",
+                        "Translator semantic tests and tests (standard library only, no game data)")),
+            ("pytest", ("Translator tests", "Translator tests (pytest)")),
+        ):
+            for name in names:
+                with self.subTest(step=name):
+                    script = step_script(ROOT, name)
+                    self.assertIn(f"$(python -I {SELECTOR} {runner})", script)
 
 
 if __name__ == "__main__":

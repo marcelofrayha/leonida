@@ -17,9 +17,6 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  PYTEST_FILE_MARKERS: '^import pytest|^ *HAVE_NUMPY ='
-
 jobs:
   change-scope:
     if: github.event_name == 'pull_request'
@@ -87,14 +84,12 @@ jobs:
         shell: bash
         run: |
           # Run every file, then fail: stopping at the first failure would hide the files after it.
+          test_files=$(python -I scripts/list_python_tests.py stdlib)
           failed=()
           while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              continue
-            fi
             echo "== $t"
-            python -I "$t" || failed+=("$t")
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
+            python -I "$t" </dev/null || failed+=("$t")
+          done <<< "$test_files"
           if (( ${#failed[@]} )); then
             for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
             exit 1
@@ -157,14 +152,11 @@ jobs:
       - name: Translator tests
         shell: bash
         run: |
+          test_files=$(python -I scripts/list_python_tests.py pytest)
           pytest_files=()
           while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              pytest_files+=("$t")
-            elif [[ "$t" == tests/test_tex_headers.py ]]; then
-              pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
-            fi
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+            pytest_files+=("$t")
+          done <<< "$test_files"
           python -m pytest "${pytest_files[@]}" -q
   semantic-tests:
     needs: change-scope
@@ -231,15 +223,13 @@ jobs:
       - name: Translator semantic tests and tests (standard library only, no game data)
         shell: bash
         run: |
+          test_files=$(python -I scripts/list_python_tests.py stdlib)
           python -m unittest discover -s tests/semantic > "$RUNNER_TEMP/semantic.log" 2>&1 &
           semantic=$!
           while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              continue
-            fi
             echo "== $t"
-            python -I "$t" || exit 1
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+            python -I "$t" </dev/null || exit 1
+          done <<< "$test_files"
           status=0
           wait "$semantic" || status=$?
           echo "== tests/semantic"
@@ -255,14 +245,11 @@ jobs:
       - name: Translator tests (pytest)
         shell: bash
         run: |
+          test_files=$(python -I scripts/list_python_tests.py pytest)
           pytest_files=()
           while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              pytest_files+=("$t")
-            elif [[ "$t" == tests/test_tex_headers.py ]]; then
-              pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
-            fi
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+            pytest_files+=("$t")
+          done <<< "$test_files"
           python -m pytest "${pytest_files[@]}" -q
 
   viewer-tests:
@@ -306,10 +293,8 @@ jobs:
       - name: Tests (standard library only, Linux)
         shell: bash
         run: |
+          test_files=$(python -I scripts/list_python_tests.py stdlib)
           while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              continue
-            fi
             echo "== $t"
-            python -I "$t" || exit 1
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+            python -I "$t" </dev/null || exit 1
+          done <<< "$test_files"

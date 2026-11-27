@@ -90,10 +90,9 @@ ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 runtime tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE`) and print `SKIP` when
 unset; `loader_test` writes small PE images to `%TEMP%\leonida_loader_test`, which antivirus can block.
 
-For pytest-based tests (the test files with `import pytest`, or no `__main__` block: they fail to import under
-`python -I`), use a virtual environment and install the pinned dependencies in
-[`tests/requirements.txt`](tests/requirements.txt). From the repository root, run `python -m pytest` with the
-test file you want to check.
+For pytest-based tests listed in [`tests/pytest-targets.txt`](tests/pytest-targets.txt), use a virtual
+environment and install the pinned dependencies in [`tests/requirements.txt`](tests/requirements.txt).
+From the repository root, run `python -m pytest` with the test file you want to check.
 
 ```powershell
 python -m pip install -r tests/requirements.txt
